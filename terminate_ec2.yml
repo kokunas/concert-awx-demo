@@ -9,8 +9,8 @@
   gather_facts: false
 
   vars:
-    aws_region: "{{ aws_region | default('eu-central-1') }}"
-    sg_name: "concert-awx-demo-sg"
+    aws_region: eu-central-1
+    sg_name: concert-awx-demo-sg
 
   module_defaults:
     group/amazon.aws.aws:

@@ -12,14 +12,16 @@
   connection: local
   gather_facts: false
 
+  # These are defaults; any extra_vars passed at launch (e.g. by Concert
+  # Workflows) override them, since extra_vars have the highest precedence.
   vars:
-    aws_region: "{{ aws_region | default('eu-central-1') }}"
-    instance_type: "{{ instance_type | default('t3.micro') }}"
-    instance_name: "{{ instance_name | default('concert-awx-demo') }}"
-    sg_name: "concert-awx-demo-sg"
+    aws_region: eu-central-1
+    instance_type: t3.micro
+    instance_name: concert-awx-demo
+    sg_name: concert-awx-demo-sg
     # Optional inbound SSH CIDR. Empty (default) = no inbound rule at all,
     # which is the safest for a demo that only needs to prove provisioning.
-    ssh_cidr: "{{ ssh_cidr | default('') }}"
+    ssh_cidr: ""
 
   module_defaults:
     group/amazon.aws.aws:
