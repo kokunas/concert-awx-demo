@@ -1,0 +1,7 @@
+---
+# AWX installs these on project sync (ansible-galaxy collection install).
+# The stock quay.io/ansible/awx-ee ships boto3/botocore but NOT amazon.aws,
+# so the collection must be declared here.
+collections:
+  - name: amazon.aws
+    version: ">=8.0.0"

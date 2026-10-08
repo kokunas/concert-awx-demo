@@ -1,0 +1,76 @@
+---
+# Provision a transient demo EC2 instance in Frankfurt (eu-central-1).
+#
+# Runs on the AWX control node (localhost) against the AWS API using the
+# AWS credential AWX injects as AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
+# This is the job template Concert Workflows launches (via the Automation
+# Controller "Job Templates Launch Create" block) as the auto-remediation /
+# provisioning action. The debug summary at the end is what Concert collects
+# back through the "Jobs Stdout Read" block.
+- name: Provision demo EC2 (Concert -> AWX orchestration PoC)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    aws_region: "{{ aws_region | default('eu-central-1') }}"
+    instance_type: "{{ instance_type | default('t3.micro') }}"
+    instance_name: "{{ instance_name | default('concert-awx-demo') }}"
+    sg_name: "concert-awx-demo-sg"
+    # Optional inbound SSH CIDR. Empty (default) = no inbound rule at all,
+    # which is the safest for a demo that only needs to prove provisioning.
+    ssh_cidr: "{{ ssh_cidr | default('') }}"
+
+  module_defaults:
+    group/amazon.aws.aws:
+      region: "{{ aws_region }}"
+
+  tasks:
+    - name: Find the latest Amazon Linux 2023 AMI (x86_64)
+      amazon.aws.ec2_ami_info:
+        owners: amazon
+        filters:
+          name: "al2023-ami-2023.*-x86_64"
+          state: available
+      register: ami_info
+
+    - name: Select the newest matching AMI
+      ansible.builtin.set_fact:
+        ami_id: "{{ (ami_info.images | sort(attribute='creation_date') | last).image_id }}"
+
+    - name: Ensure the demo security group exists
+      amazon.aws.ec2_security_group:
+        name: "{{ sg_name }}"
+        description: "Concert/AWX demo - transient, safe to delete"
+        tags:
+          managed_by: concert-awx
+        rules: "{{ ([{'proto': 'tcp', 'ports': [22], 'cidr_ip': ssh_cidr}] if (ssh_cidr | length > 0) else []) }}"
+        rules_egress:
+          - proto: all
+            cidr_ip: 0.0.0.0/0
+      register: sg
+
+    - name: Launch the t3.micro instance
+      amazon.aws.ec2_instance:
+        name: "{{ instance_name }}"
+        instance_type: "{{ instance_type }}"
+        image_id: "{{ ami_id }}"
+        security_groups:
+          - "{{ sg_name }}"
+        tags:
+          managed_by: concert-awx
+          purpose: orchestration-rfi-demo
+        wait: true
+        state: running
+      register: ec2
+
+    - name: Summarize result (collected by Concert via Jobs Stdout Read)
+      ansible.builtin.debug:
+        msg:
+          - "PROVISIONED instance_id={{ ec2.instances[0].instance_id }}"
+          - "state={{ ec2.instances[0].state.name }}"
+          - "type={{ ec2.instances[0].instance_type }}"
+          - "ami={{ ami_id }}"
+          - "public_ip={{ ec2.instances[0].public_ip_address | default('none') }}"
+          - "private_ip={{ ec2.instances[0].private_ip_address | default('none') }}"
+          - "region={{ aws_region }}"

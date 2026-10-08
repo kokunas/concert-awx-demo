@@ -1,0 +1,46 @@
+---
+# Tear down everything provision_ec2.yml created (instances tagged
+# managed_by=concert-awx, plus the demo security group). Safe to run
+# repeatedly. Wire this as a second AWX job template so the demo cleans
+# up after itself and nothing keeps billing.
+- name: Terminate demo EC2 and clean up (Concert -> AWX teardown)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    aws_region: "{{ aws_region | default('eu-central-1') }}"
+    sg_name: "concert-awx-demo-sg"
+
+  module_defaults:
+    group/amazon.aws.aws:
+      region: "{{ aws_region }}"
+
+  tasks:
+    - name: Find demo instances by tag
+      amazon.aws.ec2_instance_info:
+        filters:
+          "tag:managed_by": concert-awx
+          instance-state-name:
+            - pending
+            - running
+            - stopping
+            - stopped
+      register: found
+
+    - name: Terminate them
+      amazon.aws.ec2_instance:
+        instance_ids: "{{ found.instances | map(attribute='instance_id') | list }}"
+        state: absent
+        wait: true
+      when: found.instances | length > 0
+
+    - name: Remove the demo security group
+      amazon.aws.ec2_security_group:
+        name: "{{ sg_name }}"
+        state: absent
+      ignore_errors: true
+
+    - name: Summary (collected by Concert via Jobs Stdout Read)
+      ansible.builtin.debug:
+        msg: "TERMINATED {{ found.instances | map(attribute='instance_id') | list }}"
