@@ -22,6 +22,10 @@
     # Optional inbound SSH CIDR. Empty (default) = no inbound rule at all,
     # which is the safest for a demo that only needs to prove provisioning.
     ssh_cidr: ""
+    # Safety net: the instance self-terminates this many minutes after boot,
+    # even if the explicit teardown (terminate_ec2.yml) is forgotten, so nothing
+    # is ever left billing. Set to 0 to disable.
+    auto_terminate_minutes: 60
 
   module_defaults:
     group/amazon.aws.aws:
@@ -62,6 +66,11 @@
         tags:
           managed_by: concert-awx
           purpose: orchestration-rfi-demo
+        # Safety net: terminate (not just stop) when the OS powers off, and
+        # schedule that power-off N minutes after boot via user-data. Guarantees
+        # the instance never outlives the demo even if teardown is skipped.
+        instance_initiated_shutdown_behavior: "{{ 'terminate' if (auto_terminate_minutes | int) > 0 else 'stop' }}"
+        user_data: "{{ ('#!/bin/bash\nshutdown -h +' ~ (auto_terminate_minutes | int)) if (auto_terminate_minutes | int) > 0 else omit }}"
         wait: true
         state: running
       register: ec2
@@ -76,3 +85,4 @@
           - "public_ip={{ ec2.instances[0].public_ip_address | default('none') }}"
           - "private_ip={{ ec2.instances[0].private_ip_address | default('none') }}"
           - "region={{ aws_region }}"
+          - "auto_terminate_minutes={{ auto_terminate_minutes }}"
