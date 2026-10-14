@@ -1,0 +1,350 @@
+{
+  "name": "Disk_Full_Archive_To_S3",
+  "platform": "node",
+  "blocks": [
+    {
+      "action": "comment",
+      "value": "Disk-full alert -> archive a file to S3 to free space, via AWX. A monitoring alert (simulated by simulate_disk_full.sh on the bastion) triggers this flow. If usage >= threshold, launch the AWX job template Archive-To-S3-Free-Disk (Automation Controller 'Job Templates Launch Create'), poll it to completion ('Jobs Read 0'), read its output ('Jobs Stdout Read') and report where the file was archived. Concert -> AWX orchestration for the RFI de Orquestacion."
+    },
+    {
+      "action": "if",
+      "name": "DiskAlertGate",
+      "condition": "$alarm_usage_pct >= $threshold_pct",
+      "then": [
+        {
+          "action": "system/Ansible/Tower/Job Templates/Job Templates Launch Create",
+          "name": "LaunchArchive",
+          "inputs": [
+            {
+              "name": "authKey",
+              "value": "$awx_authkey"
+            },
+            {
+              "name": "id",
+              "value": "$job_template_id"
+            },
+            {
+              "name": "data",
+              "value": "{\"extra_vars\": {\"alarm_host\": $alarm_host, \"alarm_mount\": $alarm_mount, \"alarm_usage_pct\": $alarm_usage_pct, \"s3_bucket\": $s3_bucket, \"s3_prefix\": $s3_prefix, \"file_size_kb\": $file_size_kb, \"aws_region\": $region}}"
+            }
+          ]
+        },
+        {
+          "action": "assign",
+          "name": "SetJobId",
+          "variable": "$job_id",
+          "value": "String($LaunchArchive.result.id)"
+        },
+        {
+          "action": "while",
+          "name": "PollJob",
+          "condition": "!$poll_done && $attempts < 120",
+          "blocks": [
+            {
+              "action": "system/Ansible/Tower/Jobs/Jobs Read 0",
+              "name": "ReadJob",
+              "inputs": [
+                {
+                  "name": "authKey",
+                  "value": "$awx_authkey"
+                },
+                {
+                  "name": "id",
+                  "value": "$job_id"
+                }
+              ]
+            },
+            {
+              "action": "assign",
+              "name": "SetJobStatus",
+              "variable": "$job_status",
+              "value": "$ReadJob.result.status"
+            },
+            {
+              "action": "assign",
+              "name": "SetPollDone",
+              "variable": "$poll_done",
+              "value": "($job_status == 'successful' || $job_status == 'failed' || $job_status == 'error' || $job_status == 'canceled')"
+            },
+            {
+              "action": "assign",
+              "name": "IncAttempts",
+              "variable": "$attempts",
+              "value": "$attempts + 1"
+            },
+            {
+              "action": "system/Common/Sleep",
+              "name": "PollSleep",
+              "inputs": [
+                {
+                  "name": "seconds",
+                  "value": "10"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "action": "system/Ansible/Tower/Jobs/Jobs Stdout Read",
+          "name": "ReadStdout",
+          "inputs": [
+            {
+              "name": "authKey",
+              "value": "$awx_authkey"
+            },
+            {
+              "name": "id",
+              "value": "$job_id"
+            }
+          ]
+        },
+        {
+          "action": "assign",
+          "name": "SetArchived",
+          "variable": "$archived",
+          "value": "String($ReadStdout.result.content).indexOf('s3_uri=') >= 0 ? String($ReadStdout.result.content).split('s3_uri=')[1].split('\"')[0].split('\\n')[0].split(' ')[0] : ''"
+        }
+      ],
+      "else": [
+        {
+          "action": "assign",
+          "name": "ResultBelow",
+          "variable": "$result",
+          "value": "{\"decision\": \"no-op - uso por debajo del umbral\", \"host\": $alarm_host, \"mount\": $alarm_mount, \"usage\": $alarm_usage_pct, \"threshold\": $threshold_pct}"
+        }
+      ]
+    },
+    {
+      "action": "if",
+      "name": "FinalDone",
+      "condition": "$job_status == 'successful'",
+      "then": [
+        {
+          "action": "assign",
+          "name": "ResultDone",
+          "variable": "$result",
+          "value": "{\"alarm\": $alarm_id, \"host\": $alarm_host, \"mount\": $alarm_mount, \"usage_before\": $alarm_usage_pct, \"archived_to\": $archived, \"job_id\": $job_id, \"decision\": \"archived - disco liberado via AWX/S3\"}"
+        }
+      ],
+      "else": []
+    },
+    {
+      "action": "if",
+      "name": "FinalFailed",
+      "condition": "$alarm_usage_pct >= $threshold_pct && $job_status != 'successful'",
+      "then": [
+        {
+          "action": "assign",
+          "name": "ResultFailed",
+          "variable": "$result",
+          "value": "{\"alarm\": $alarm_id, \"host\": $alarm_host, \"job_id\": $job_id, \"job_status\": $job_status, \"decision\": \"archivado iniciado pero el job AWX no termino OK - revisar\"}"
+        }
+      ],
+      "else": []
+    }
+  ],
+  "variables": [
+    {
+      "name": "alarm_host",
+      "required": false,
+      "isInput": true,
+      "isOutput": false,
+      "level": "INTERMEDIATE",
+      "type": {
+        "type": "string"
+      },
+      "value": "\"web-prod-01\""
+    },
+    {
+      "name": "alarm_mount",
+      "required": false,
+      "isInput": true,
+      "isOutput": false,
+      "level": "INTERMEDIATE",
+      "type": {
+        "type": "string"
+      },
+      "value": "\"/var/log\""
+    },
+    {
+      "name": "alarm_usage_pct",
+      "required": false,
+      "isInput": true,
+      "isOutput": false,
+      "level": "INTERMEDIATE",
+      "type": {
+        "type": "number"
+      },
+      "value": "96"
+    },
+    {
+      "name": "alarm_id",
+      "required": false,
+      "isInput": true,
+      "isOutput": false,
+      "level": "INTERMEDIATE",
+      "type": {
+        "type": "string"
+      },
+      "value": "\"DISK-FULL-0001\""
+    },
+    {
+      "name": "threshold_pct",
+      "required": false,
+      "isInput": true,
+      "isOutput": false,
+      "level": "INTERMEDIATE",
+      "type": {
+        "type": "number"
+      },
+      "value": "90"
+    },
+    {
+      "name": "s3_bucket",
+      "required": false,
+      "isInput": true,
+      "isOutput": false,
+      "level": "INTERMEDIATE",
+      "type": {
+        "type": "string"
+      },
+      "value": "\"kokunas-concert-disk-archive\""
+    },
+    {
+      "name": "s3_prefix",
+      "required": false,
+      "isInput": true,
+      "isOutput": false,
+      "level": "INTERMEDIATE",
+      "type": {
+        "type": "string"
+      },
+      "value": "\"disk-archive/\""
+    },
+    {
+      "name": "file_size_kb",
+      "required": false,
+      "isInput": true,
+      "isOutput": false,
+      "level": "INTERMEDIATE",
+      "type": {
+        "type": "number"
+      },
+      "value": "256"
+    },
+    {
+      "name": "awx_authkey",
+      "required": false,
+      "isInput": true,
+      "isOutput": false,
+      "level": "INTERMEDIATE",
+      "type": {
+        "type": "string"
+      },
+      "value": "\"concertuser/AWX-Demo\""
+    },
+    {
+      "name": "job_template_id",
+      "required": false,
+      "isInput": true,
+      "isOutput": false,
+      "level": "INTERMEDIATE",
+      "type": {
+        "type": "string"
+      },
+      "value": "\"11\""
+    },
+    {
+      "name": "region",
+      "required": false,
+      "isInput": true,
+      "isOutput": false,
+      "level": "INTERMEDIATE",
+      "type": {
+        "type": "string"
+      },
+      "value": "\"eu-central-1\""
+    },
+    {
+      "name": "job_id",
+      "required": false,
+      "isInput": false,
+      "isOutput": false,
+      "level": "INTERMEDIATE",
+      "type": {
+        "type": "string"
+      },
+      "value": "\"\""
+    },
+    {
+      "name": "job_status",
+      "required": false,
+      "isInput": false,
+      "isOutput": false,
+      "level": "INTERMEDIATE",
+      "type": {
+        "type": "string"
+      },
+      "value": "\"\""
+    },
+    {
+      "name": "poll_done",
+      "required": false,
+      "isInput": false,
+      "isOutput": false,
+      "level": "INTERMEDIATE",
+      "type": {
+        "type": "boolean"
+      },
+      "value": "false"
+    },
+    {
+      "name": "attempts",
+      "required": false,
+      "isInput": false,
+      "isOutput": false,
+      "level": "INTERMEDIATE",
+      "type": {
+        "type": "number"
+      },
+      "value": "0"
+    },
+    {
+      "name": "archived",
+      "required": false,
+      "isInput": false,
+      "isOutput": false,
+      "level": "INTERMEDIATE",
+      "type": {
+        "type": "string"
+      },
+      "value": "\"\""
+    },
+    {
+      "name": "result",
+      "required": false,
+      "isInput": false,
+      "isOutput": true,
+      "level": "INTERMEDIATE",
+      "type": {
+        "type": "any"
+      },
+      "value": "\"\""
+    }
+  ],
+  "meta": {
+    "workerGroup": "default",
+    "layout": "flow",
+    "description": "Disk-full alert -> archive a file to S3 to free space via AWX (launch JT -> poll -> stdout). Triggered from the bastion simulator.",
+    "tags": [
+      {
+        "name": "Consumer",
+        "value": "Concert"
+      },
+      {
+        "name": "Category",
+        "value": "Auto-Remediation"
+      }
+    ]
+  }
+}

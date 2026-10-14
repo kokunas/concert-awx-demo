@@ -1,0 +1,92 @@
+---
+# Archive a file to S3 to free disk space (Concert -> AWX orchestration).
+#
+# Launched as an AWX job template that Concert Workflows triggers when a
+# "disk full" alert fires. Each AWX job runs in a fresh execution-environment
+# container, so the file to archive is created here, uploaded to S3, and the
+# local copy deleted to "free" the space. The final `ARCHIVED ...` summary line
+# is what Concert collects back through the "Jobs Stdout Read" block
+# (it parses `s3_uri=`).
+#
+# Runs on the AWX control node (localhost) against the AWS API using the AWS
+# credential AWX injects as AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
+#
+# PRE-REQUISITE: the S3 bucket must already exist and the IAM user must have
+#   s3:PutObject + s3:GetObject on  arn:aws:s3:::<bucket>/*
+#   s3:ListBucket  on                arn:aws:s3:::<bucket>
+# The bucket is intentionally NOT created here (keeps the IAM policy minimal and
+# avoids the GetBucket* probes that `s3_bucket state=present` would make).
+- name: Archive file to S3 to free disk (Concert -> AWX)
+  hosts: localhost
+  connection: local
+  gather_facts: true            # for ansible_date_time (timestamped object key)
+
+  # Defaults; any extra_vars passed at launch (by Concert Workflows) override them.
+  vars:
+    aws_region: eu-central-1
+    s3_bucket: ""               # REQUIRED - pass as extra_var
+    s3_prefix: "disk-archive/"
+    alarm_host: "unknown-host"
+    alarm_mount: "/var/log"
+    alarm_usage_pct: 0
+    file_size_kb: 256           # the sample file is small; this is a demo
+
+  module_defaults:
+    group/amazon.aws.aws:
+      region: "{{ aws_region }}"
+
+  tasks:
+    - name: Require an S3 bucket name
+      ansible.builtin.assert:
+        that: s3_bucket | length > 0
+        fail_msg: "s3_bucket extra_var is required (pre-create the bucket)."
+
+    - name: Compute working paths
+      ansible.builtin.set_fact:
+        work_dir: "/tmp/concert-disk-archive"
+        stamp: "{{ ansible_date_time.iso8601_basic_short }}"
+
+    - name: Ensure the work directory exists
+      ansible.builtin.file:
+        path: "{{ work_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Name the file to archive
+      ansible.builtin.set_fact:
+        local_file: "{{ work_dir }}/{{ alarm_host }}-{{ stamp }}.log"
+        object_key: "{{ s3_prefix }}{{ alarm_host }}/{{ alarm_host }}-{{ stamp }}.log"
+
+    - name: Create a sample "old log" file to archive
+      ansible.builtin.command:
+        cmd: "dd if=/dev/zero of={{ local_file }} bs=1024 count={{ file_size_kb | int }}"
+      changed_when: true
+
+    - name: Stat the file (bytes we will free)
+      ansible.builtin.stat:
+        path: "{{ local_file }}"
+      register: f
+
+    - name: Upload the file to S3
+      amazon.aws.s3_object:
+        bucket: "{{ s3_bucket }}"
+        object: "{{ object_key }}"
+        src: "{{ local_file }}"
+        mode: put
+      register: up
+
+    - name: Delete the local file (free the space)
+      ansible.builtin.file:
+        path: "{{ local_file }}"
+        state: absent
+
+    - name: Summary (collected by Concert via Jobs Stdout Read)
+      ansible.builtin.debug:
+        msg:
+          - "ARCHIVED s3_uri=s3://{{ s3_bucket }}/{{ object_key }}"
+          - "bytes={{ f.stat.size }}"
+          - "freed_bytes={{ f.stat.size }}"
+          - "host={{ alarm_host }}"
+          - "mount={{ alarm_mount }}"
+          - "usage_before={{ alarm_usage_pct }}"
+          - "region={{ aws_region }}"
