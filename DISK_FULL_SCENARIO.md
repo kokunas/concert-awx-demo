@@ -57,8 +57,8 @@ From the bastion (or anywhere with cluster access). Get the AWX host + admin
 password from the cluster, then run the script:
 
 ```bash
-export AWX_HOST=$(oc -n awx get route awx -o jsonpath='{.spec.host}')
-export AWX_PW=$(oc -n awx get secret awx-admin-password -o jsonpath='{.data.password}' | base64 -d)
+export AWX_HOST=$(oc -n awx get route awx-demo -o jsonpath='{.spec.host}')
+export AWX_PW=$(oc -n awx get secret awx-demo-admin-password -o jsonpath='{.data.password}' | base64 -d)
 python3 setup/awx_add_s3_jobtemplate.py
 ```
 
