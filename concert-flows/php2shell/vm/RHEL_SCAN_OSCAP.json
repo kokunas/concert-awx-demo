@@ -1,0 +1,599 @@
+{
+ "name": "RHEL_SCAN_OSCAP",
+ "platform": "node",
+ "hash": "bMdA1tLFaWCE8KXhhOKDCKgY5S+GF2jWgLJCFplo1MY=",
+ "blocks": [
+  {
+   "action": "system/Common/Config Data/Get Config Data",
+   "name": "GetConfigData",
+   "inputs": [
+    {
+     "name": "authKey",
+     "value": "$vmConfig"
+    }
+   ]
+  },
+  {
+   "name": "Function_1",
+   "function": "$vm_config_list = $GetConfigData.result;\n$host_list = Object.keys($vm_config_list)"
+  },
+  {
+   "action": "foreach-parallel",
+   "name": "ForEachVMConfig",
+   "list": "$host_list",
+   "concurrency": "1",
+   "blocks": [
+    {
+     "action": "comment",
+     "value": "Check the type of component (aix, redhat or sles). only for redhat and sles the scan will be run"
+    },
+    {
+     "action": "assign",
+     "name": "Assign_2",
+     "variable": "$logs[$ForEachVMConfig.item]",
+     "value": "{\"error\": [], \"data\": {}}"
+    },
+    {
+     "action": "system/Common/SSH/SSH",
+     "name": "GetVMType",
+     "inputs": [
+      {
+       "name": "authKey",
+       "value": "$vm_config_list[$ForEachVMConfig.item]"
+      },
+      {
+       "name": "command",
+       "value": "\"uname -s\""
+      }
+     ]
+    },
+    {
+     "action": "if",
+     "name": "GetTypeStatus",
+     "condition": "$GetVMType.exitcode === 0",
+     "then": [
+      {
+       "action": "assign",
+       "name": "SetVMType",
+       "variable": "$vm_type",
+       "value": "$GetVMType.result.trim().toLowerCase()"
+      },
+      {
+       "action": "if",
+       "name": "CheckLinux",
+       "condition": "$vm_type === \"linux\"",
+       "then": [
+        {
+         "action": "comment",
+         "value": "Get the version of  linux and accordingly pull the oval file"
+        },
+        {
+         "action": "system/Common/SSH/SSH",
+         "name": "GetVersion",
+         "inputs": [
+          {
+           "name": "authKey",
+           "value": "$vm_config_list[$ForEachVMConfig.item]"
+          },
+          {
+           "name": "command",
+           "value": "#!/bin/bash\nset -e  # exit immediately if any command fails\n\n# Get OS version\nversion=$(grep '^VERSION_ID=' /etc/os-release | cut -d= -f2 | tr -d '\"')\n\n# Check version not empty\nif [ -z \"$version\" ]; then\n    echo \"Failed to get OS version\"\n    exit 1\nfi\n\n# Get OS ID\nid=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '\"')\n\nif [ -z \"$id\" ]; then\n    echo \"Failed to get OS ID\"\n    exit 1\nfi\n\necho \"Version: $version\"\necho \"ID: $id\"",
+           "type": "const"
+          }
+         ]
+        },
+        {
+         "action": "if",
+         "name": "CheckGetVersion",
+         "condition": "$GetVersion.exitcode === 0",
+         "then": [
+          {
+           "name": "Function_2_1",
+           "function": "const shellOutput = $GetVersion.result\n\nconst info = Object.fromEntries(\n  shellOutput\n    .trim()\n    .split('\\n')\n    .map(line => line.split(':').map(v => v.trim()))\n);\n\nlet version = info.Version;\nlet type = info.ID;\nlet [majorVersion, minorVersion] = version.split('.');\n\n// Generate candidate URLs\nlet urls = [];\nif (type === 'rhel') {\n  // Red Hat uses only major version\n  type = \"redhat\"\n  urls.push(`https://security.access.redhat.com/data/oval/v2/RHEL${majorVersion}/rhel-${majorVersion}.oval.xml.bz2`);\n} else if (type === \"sles\") {\n  // Try minor \u2192 fallback \u2192 major\n  urls.push(`https://ftp.suse.com/pub/projects/security/oval/suse.linux.enterprise.server.${majorVersion}-SP${minorVersion}.xml.bz2`);\n  urls.push(`https://ftp.suse.com/pub/projects/security/oval/suse.linux.enterprise.server.${majorVersion}.xml.bz2`);\n}\n\n$vm_data = {\n  type,\n  version,\n  majorVersion,\n  minorVersion,\n  urls\n}\n"
+          },
+          {
+           "action": "if",
+           "name": "CheckSupportedTypes",
+           "condition": "$vm_data.type === \"redhat\" || $vm_data.type === \"sles\"",
+           "then": [],
+           "else": [
+            {
+             "action": "continue"
+            }
+           ]
+          },
+          {
+           "action": "foreach",
+           "name": "ForEachurl",
+           "list": "$vm_data.urls",
+           "blocks": [
+            {
+             "action": "comment",
+             "value": "Run the scan on remote host, pull the file, convert it to the required format and Upload to the evidence Locker. Then run the assessment"
+            },
+            {
+             "action": "system/Common/SSH/SSH",
+             "name": "CreateOscapDirectory",
+             "inputs": [
+              {
+               "name": "authKey",
+               "value": "$vm_config_list[$ForEachVMConfig.item]"
+              },
+              {
+               "name": "command",
+               "value": "\"mkdir -p oscap && cd oscap && wget -O oval.xml.bz2  \\\"\" + $ForEachurl.item + \"\\\"\""
+              }
+             ]
+            },
+            {
+             "action": "system/Common/SSH/SSH",
+             "name": "RunScan",
+             "inputs": [
+              {
+               "name": "authKey",
+               "value": "$vm_config_list[$ForEachVMConfig.item]"
+              },
+              {
+               "name": "command",
+               "value": "set -euo pipefail\n\n# Detect distro\ndistro=$(grep -E '^ID=' /etc/os-release | cut -d= -f2 | tr -d '\"')\n\n# Install required packages (bzip2 + openscap-scanner)\ninstall_packages() {\n  if [[ \"$distro\" == \"rhel\" ]]; then\n    sudo dnf install -y -q bzip2 openscap-scanner\n  elif [[ \"$distro\" == \"sles\" ]]; then\n    sudo zypper --non-interactive install -y bzip2 openscap >/dev/null\n  else\n    echo \"Unsupported distro: $distro. Expected 'rhel' or 'sles'.\"\n    exit 1\n  fi\n}\n\n# Ensure required tools exist\nif ! command -v bzip2 >/dev/null 2>&1 || ! command -v oscap >/dev/null 2>&1; then\n  echo \"Installing required packages...\"\n  install_packages\nfi\n\n# Validate oscap installation\nif ! command -v oscap >/dev/null 2>&1; then\n  echo \"ERROR: oscap is not installed even after attempting installation.\"\n  exit 1\nfi\n\n# Process OVAL file\nmkdir -p oscap\ncd oscap\n\nif [[ ! -f \"oval.xml.bz2\" ]]; then\n  echo \"ERROR: oval.xml.bz2 not found in oscap directory.\"\n  exit 1\nfi\n\nrm -f oval.xml result.html\nbzip2 -dc oval.xml.bz2 > oval.xml\n\necho \"Running OpenSCAP scan...\"\n\n# Run oscap scan\nif ! oscap oval eval --report result.html oval.xml; then\n  echo \"OpenSCAP evaluation failed.\"\n  exit 1\nfi\n\necho \"Scan complete. Report generated: oscap/result.html\"\nexit 0",
+               "type": "const"
+              }
+             ]
+            },
+            {
+             "action": "if",
+             "name": "CheckScanStatus",
+             "condition": "$RunScan.exitcode === 0",
+             "then": [
+              {
+               "action": "system/Common/SFTP/SFTP Get File",
+               "name": "SFTPGetOscapFile",
+               "inputs": [
+                {
+                 "name": "authKey",
+                 "value": "$vm_config_list[$ForEachVMConfig.item]"
+                },
+                {
+                 "name": "file",
+                 "value": "\"oscap/result.html\""
+                }
+               ]
+              },
+              {
+               "name": "Function_2",
+               "function": "function safeTrim(str) {\n    return str ? str.replace(/\\s+/g, \" \").trim() : \"\";\n};\n\nfunction getHostInfo(html) {\n    const hostInfo = {\n        hostIP: \"\",\n        hostName: \"\",\n        osVersion: \"\",\n        arch: \"\"\n    };\n\n    const patterns = {\n        hostIP: /IP Address<\\/td>\\s*<td[^>]*>([^<]+)<\\/td>/i,\n        hostName: /Host Name<\\/td>\\s*<td[^>]*>([^<]+)<\\/td>/i,\n        osVersion: /OS Version<\\/td>\\s*<td[^>]*>([^<]+)<\\/td>/i,\n        arch: /Architecture<\\/td>\\s*<td[^>]*>([^<]+)<\\/td>/i\n    };\n\n    for (const key in patterns) {\n        const match = html.match(patterns[key]);\n\n        if (match)\n            hostInfo[key] = safeTrim(match[1]);\n    }\n\n    return hostInfo;\n}\n\nfunction getTableRows(html) {\n    const rows = [];\n    const trMatches = [...html.matchAll(/<tr[^>]*>([\\s\\S]*?)<\\/tr>/gi)];\n\n    for (const tr of trMatches) {\n        const trContent = tr[1];\n        const tdMatches = [...trContent.matchAll(/<td[^>]*>([\\s\\S]*?)<\\/td>/gi)].map(m => safeTrim(m[1]));\n\n        if (tdMatches.length < 5)\n            continue;\n\n        const result = tdMatches[1];\n        const classType = tdMatches[2];\n\n        if (result !== \"true\")\n            continue;\n\n        const referenceHTML = tdMatches[3];\n\n        const referenceMatches = [...referenceHTML.matchAll(\n            />((?:RHSA|RHBA)-\\d{4}:\\d{4,5}|CVE-\\d{4}-\\d{4,7}|SUSE-(?:SU|RU|SLE|LTSS)-[\\w:-]+)/g\n        )].map(m => m[1]);\n\n        const rhsa = referenceMatches.find(r => r.startsWith(\"RHSA\") || r.startsWith(\"RHBA\")) || \"\";\n        const cves = referenceMatches.filter(r => r.startsWith(\"CVE\"));\n        const title = tdMatches[4] || \"\";\n        let plugin = \"\";\n        let updateInfo = \"\";\n        let severity = \"\";\n        const titleParts = title.split(\":\");\n\n        if (titleParts.length >= 2) {\n            plugin = titleParts.slice(1).join(\":\").trim().split(\" \")[0];\n            updateInfo = titleParts.slice(1).join(\":\").trim();\n            const sevMatch = title.match(/\\(([^)]+)\\)/);\n            severity = sevMatch ? safeTrim(sevMatch[1]).toLowerCase() : \"\";\n        }\n\n        rows.push({\n            rhsa,\n            cves,\n            plugin,\n            updateInfo,\n            severity\n        });\n    }\n\n    return rows;\n}\n\nfunction combineData(hostInfo, tableRows, ip) {\n    return tableRows.flatMap(row => row.cves.map(cve => ({\n        \"CVE\": cve,\n        \"Description\": row.updateInfo,\n        \"severity\": row.severity,\n        \"Host IPAddress\": ip,\n        \"Host Name\": hostInfo.hostName,\n        \"recommended_advisory\": row.rhsa,\n        \"Package\": \"\",\n        \"Package Version\": \"\",\n        \"Package Path\": \"\",\n        \"hasFix\": \"\",\n        \"Fixed Version\": \"\",\n        \"Score\": \"\"\n    })));\n}\n\nfunction convertToCSV(data) {\n    if (!data.length)\n        return \"CVE,Description,severity,Host IPAddress,Host Name,recommended_advisory,Package,Package Version,Package Path,hasFix,Fixed Version,Score\";\n\n    const headers = Object.keys(data[0]);\n    const lines = [headers.join(\",\")];\n\n    data.forEach(row => {\n        const line = headers.map(h => {\n            const val = row[h] || \"\";\n            return typeof val === \"string\" && val.includes(\",\") ? `\"${val.replace(/\"/g, \"\\\"\\\"\")}\"` : val;\n        }).join(\",\");\n\n        lines.push(line);\n    });\n\n    return lines.join(\"\\n\");\n}\n\nfunction processHTMLToCSV(htmlContent, ip) {\n    const hostInfo = getHostInfo(htmlContent);\n    const tableRows = getTableRows(htmlContent);\n    const combinedData = combineData(hostInfo, tableRows, ip);\n    const csv = convertToCSV(combinedData);\n    return csv;\n}\n\n$scan_report = processHTMLToCSV($SFTPGetOscapFile.result, $ForEachVMConfig.item);\nconst formattedIP = $ForEachVMConfig.item.replace(/\\./g, \"_\");\nconst now = new Date();\nconst pad = n => n.toString().padStart(2, \"0\");\nconst dateline = `${pad(now.getDate())}_${pad(now.getMonth() + 1)}_${now.getFullYear()}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;\n$file_name = `power-linux-scans/${formattedIP}/${dateline}.csv`"
+              },
+              {
+               "name": "Function_4",
+               "function": "function processGrypeJSON(grypeJsonContent, hostIP, hostName) {\n    if (!grypeJsonContent || grypeJsonContent.trim() === \"\") {\n        console.log(\"Grype scan result is empty, returning empty array\");\n        return [];\n    }\n\n    let grypeData;\n\n    try {\n        grypeData = typeof grypeJsonContent === \"string\" ? JSON.parse(grypeJsonContent) : grypeJsonContent;\n    } catch (e) {\n        console.log(\"Failed to parse Grype JSON, returning empty array:\", e.message);\n        return [];\n    }\n\n    const mappedData = [];\n    const matches = grypeData.matches || [];\n\n    if (matches.length === 0) {\n        console.log(\"No vulnerabilities found in Grype scan\");\n        return [];\n    }\n\n    for (const entry of matches) {\n        const vul = entry.vulnerability || {};\n        const matchDetails = (entry.matchDetails || [{}])[0];\n        const artifact = entry.artifact || {};\n        const metadata = artifact.metadata || {};\n        const cvssArray = vul.cvss || [];\n        const cvssMetrics = cvssArray.length > 0 ? (cvssArray[0].metrics || {}) : {};\n        const exploitabilityScore = cvssMetrics.exploitabilityScore || \"\";\n        const searchedBy = matchDetails.searchedBy || {};\n        const packageInfo = searchedBy.package || {};\n        const fix = vul.fix || {};\n        const hasFix = fix.state === \"fixed\" ? \"Y\" : \"N\";\n        const fixVersions = fix.versions || [];\n        const fixedVersion = fixVersions.length > 0 ? fixVersions.sort()[0] : \"\";\n\n        mappedData.push({\n            \"CVE\": vul.id || \"\",\n            \"Description\": vul.description || \"\",\n            \"severity\": vul.severity || \"\",\n            \"Host IPAddress\": hostIP,\n            \"Host Name\": hostName,\n            \"recommended_advisory\": \"\",\n            \"Package\": packageInfo.name || \"\",\n            \"Package Version\": packageInfo.version || \"\",\n            \"Package Path\": metadata.virtualPath || \"\",\n            \"hasFix\": hasFix,\n            \"Fixed Version\": fixedVersion,\n            \"Score\": exploitabilityScore\n        });\n    }\n\n    return mappedData;\n};\n\nfunction parseCSVToArray(csvContent) {\n    const lines = csvContent.trim().split(\"\\n\");\n\n    if (lines.length === 0)\n        return [];\n\n    function parseCSVLine(line) {\n        const result = [];\n        let current = \"\";\n        let inQuotes = false;\n\n        for (let i = 0; i < line.length; i++) {\n            const char = line[i];\n            const nextChar = line[i + 1];\n\n            if (char === \"\\\"\") {\n                if (inQuotes && nextChar === \"\\\"\") {\n                    current += \"\\\"\";\n                    i++;\n                } else {\n                    inQuotes = !inQuotes;\n                }\n            } else if (char === \",\" && !inQuotes) {\n                result.push(current);\n                current = \"\";\n            } else {\n                current += char;\n            }\n        }\n\n        result.push(current);\n        return result;\n    }\n\n    const headers = parseCSVLine(lines[0]);\n    const data = [];\n\n    for (let i = 1; i < lines.length; i++) {\n        if (!lines[i].trim())\n            continue;\n\n        const values = parseCSVLine(lines[i]);\n        const obj = {};\n\n        headers.forEach((header, index) => {\n            obj[header] = values[index] || \"\";\n        });\n\n        data.push(obj);\n    }\n\n    return data;\n}\n\nfunction convertToCSV(data) {\n    if (!data.length)\n        return \"CVE,Description,severity,Host IPAddress,Host Name,recommended_advisory,Package,Package Version,Package Path,hasFix,Fixed Version,Score\";\n\n    const headers = Object.keys(data[0]);\n    const lines = [headers.join(\",\")];\n\n    data.forEach(row => {\n        const line = headers.map(h => {\n            const val = row[h] || \"\";\n            return typeof val === \"string\" && val.includes(\",\") ? `\"${val.replace(/\"/g, \"\\\"\\\"\")}\"` : val;\n        }).join(\",\");\n\n        lines.push(line);\n    });\n\n    return lines.join(\"\\n\");\n}\n\nconst grypeData = []; // Grype step removed in this copy: OpenSCAP (Red Hat OVAL) only\nconst oscapData = parseCSVToArray($scan_report);\nconst combinedData = [...oscapData, ...grypeData];\n$combined_scan_report = convertToCSV(combinedData)\n\nconst rows = parseCSVToArray($combined_scan_report);\nconst dict = {};\n\nfor (const row of rows) {\n    const ip = row[\"Host IPAddress\"]?.trim();\n    const hostname = row[\"Host Name\"]?.trim() || \"\";\n\n    if (!ip)\n        continue;\n\n    // Only add once per IP\n    if (!dict[ip]) {\n        dict[ip] = [hostname, $vm_data.version];\n    }\n}\n\n$runtime_dict = dict"
+              },
+              {
+               "name": "Function_5",
+               "function": "\n\nconst runtimeComponents = [];\nlet counter = 1;\n\nfor (const [ip, [hostname, version]] of Object.entries($runtime_dict)) {\n    const vmName = `${$vm_data.type}-vm${counter}`;\n    const bomRef = `service:vm:${vmName}`;\n\n    const componentEntry = {\n        \"bom-ref\": bomRef,\n        \"name\": $vm_data.type,\n        \"type\": \"vm\",\n        \"ipv4\": [\n            { \"addr\": ip }\n        ],\n        \"ipv6\": [{\"addr\": \"0d87:96f4:78ec:401b:d83d:5f35:d5fe:19bb\"}],\n        \"hostname\": hostname,\n        \"properties\": [\n            { \"name\": \"os\", \"value\": $vm_data.type },\n            { \"name\": \"version\", \"value\": version }\n        ],\n        \"components\": [ {\n                    \"bom-resf\": \"container:icr.io/\"+$application_name+\"-app-image\",\n                    \"type\": \"container\",\n                    \"name\": \"icr.io/\"+$application_name+\"-image\",\n                    \"tag\": \"v1.0.0\",\n                    \"digest\": \"sha256:963325e670dc7a8735d857647f887f8cd41a6f4035228d4b6c2c965b5ca74\"+counter+\"ce\",\n                    \"uri\": \"icr.io/mobile-baking-app-image:v1.0.0@sha256:963325e670dc7a8735d857647f887f8cd41a6f4035228d4b6c2c965b5ca74\"+counter+\"ce\"\n                }]\n    };\n\n    runtimeComponents.push(componentEntry);\n    counter++;\n}\n\n$deploysbom={\n    \"bomFormat\": \"ConcertDef\",\n    \"specVersion\": \"1.0.2\",\n    \"metadata\": {\n        \"timestamp\": new Date().toISOString(),\n        \"type\": \"deploy\",\n        \"environment\": \"staging\",\n        \"component\": {\n            \"name\": $application_name,\n            \"version\":$application_version,\n            \"deploy-number\": \"29\"\n        }\n    },\n    \"components\": [],\n    \"runtime-components\": runtimeComponents,\n    \"services\": []\n}\n\n"
+              },
+              {
+               "action": "if",
+               "name": "if_create_app_deploy_sbom",
+               "condition": "$create_app_deploy_sbom",
+               "then": [
+                {
+                 "action": "assign",
+                 "name": "Assign_app_sbom",
+                 "variable": "$app_sbom",
+                 "value": "{\n    \"bomFormat\": \"ConcertDef\",\n    \"specVersion\": \"1.0.2\",\n\n    \"metadata\": {\n        \"timestamp\": \"2024-11-21T11:42:35Z\",\n        \"type\": \"application\",\n\n        \"component\": {\n            \"name\": $application_name,\n            \"version\": $application_version\n        },\n        \"business\": {\n            \"name\": \"IBM\",\n\n            \"units\": [{\n                \"name\": \"Automation\",\n                \"email\": \"myemail@ibm.com\",\n                \"phone\": \"(123) 123-1234\"\n            }]\n        }\n    },\n    \"environments\": [{\n        \"bom-ref\": \"environment:staging\",\n        \"type\": \"environment\",\n        \"name\": \"staging\"\n    }],\n    \"components\": [],\n\n    \"properties\": [{\n        \"name\": \"application_criticality\",\n        \"value\": \"5\"\n    }],\n    \"services\": []\n}"
+                },
+                {
+                 "action": "system/IBM/Concert v2/Import Data/Upload Files to Concert",
+                 "name": "IngestAppSbom",
+                 "inputs": [
+                  {
+                   "name": "file",
+                   "value": "{\n    \"data_type\": \"application_sbom\",\n    \"metadata\": \"{\\\"scanner_name\\\":\\\"others\\\"}\",\n    \"filename\": JSON.stringify($app_sbom)\n}"
+                  },
+                  {
+                   "name": "fileType",
+                   "value": "\"json\""
+                  }
+                 ]
+                },
+                {
+                 "action": "system/Common/Sleep",
+                 "name": "Sleep_1",
+                 "inputs": [
+                  {
+                   "name": "seconds",
+                   "value": "10"
+                  }
+                 ]
+                },
+                {
+                 "action": "system/IBM/Concert v2/Import Data/Upload Files to Concert",
+                 "name": "IngestDeploySbom",
+                 "inputs": [
+                  {
+                   "name": "file",
+                   "value": "{\n    \"data_type\": \"application_sbom\",\n    \"metadata\": \"{\\\"scanner_name\\\":\\\"others\\\"}\",\n    \"filename\": JSON.stringify($deploysbom)\n}"
+                  },
+                  {
+                   "name": "fileType",
+                   "value": "\"json\""
+                  }
+                 ]
+                },
+                {
+                 "action": "system/Common/Sleep",
+                 "name": "Sleep_2",
+                 "inputs": [
+                  {
+                   "name": "seconds",
+                   "value": "10"
+                  }
+                 ]
+                }
+               ],
+               "else": []
+              },
+              {
+               "action": "system/IBM/Concert v2/Import Data/Upload Files to Concert",
+               "name": "IngestScanFile",
+               "inputs": [
+                {
+                 "name": "file",
+                 "value": "{\n    \"data_type\": \"vm_scan\",\n    \"metadata\": \"{\\\"scanner_name\\\":\\\"others\\\"}\",\n    \"filename\": $combined_scan_report\n}"
+                },
+                {
+                 "name": "fileType",
+                 "value": "\"csv\""
+                }
+               ]
+              },
+              {
+               "action": "assign",
+               "name": "Assign_1",
+               "variable": "$vm_data[\"el_result\"]",
+               "value": "$IngestScanFile.result"
+              },
+              {
+               "action": "system/Common/Array/Array Push",
+               "name": "ArrayPush_2",
+               "inputs": [
+                {
+                 "name": "array",
+                 "value": "$assessment_payload"
+                },
+                {
+                 "name": "item",
+                 "value": "{\n    \"ip\": $ForEachVMConfig.item,\n    \"file_path\": $IngestScanFile.result.record_paths[0]\n}"
+                }
+               ]
+              }
+             ],
+             "else": [
+              {
+               "action": "system/Common/Array/Array Push",
+               "name": "ArrayPush_1",
+               "inputs": [
+                {
+                 "name": "array",
+                 "value": "$logs[$ForEachVMConfig.item][\"error\"]"
+                },
+                {
+                 "name": "item",
+                 "value": "$CheckScanStatus"
+                }
+               ]
+              }
+             ]
+            },
+            {
+             "action": "break"
+            }
+           ]
+          }
+         ],
+         "else": [
+          {
+           "action": "system/Common/Array/Array Push",
+           "name": "LogError_2",
+           "inputs": [
+            {
+             "name": "array",
+             "value": "$logs[$ForEachVMConfig.item][\"error\"]"
+            },
+            {
+             "name": "item",
+             "value": "$GetVersion"
+            }
+           ]
+          },
+          {
+           "action": "continue"
+          }
+         ]
+        },
+        {
+         "name": "Function_3",
+         "function": "$logs[$ForEachVMConfig.item][\"data\"] = $vm_data;\n$vm_data = {}"
+        }
+       ],
+       "else": [
+        {
+         "action": "continue"
+        }
+       ]
+      }
+     ],
+     "else": [
+      {
+       "action": "system/Common/Array/Array Push",
+       "name": "LogError",
+       "inputs": [
+        {
+         "name": "array",
+         "value": "$logs[$ForEachVMConfig.item][\"error\"]"
+        },
+        {
+         "name": "item",
+         "value": "$GetVMType"
+        }
+       ]
+      },
+      {
+       "action": "continue"
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "variables": [
+  {
+   "name": "vmConfig",
+   "required": true,
+   "isInput": true,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"\"",
+   "meta": {
+    "authType": "ANY",
+    "subType": "authentication"
+   }
+  },
+  {
+   "name": "vm_config_list",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "object"
+   },
+   "value": "{}"
+  },
+  {
+   "name": "vm_type",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"\""
+  },
+  {
+   "name": "vm_data",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "object"
+   },
+   "value": "{}"
+  },
+  {
+   "name": "html_scan",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"\""
+  },
+  {
+   "name": "scan_report",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"\""
+  },
+  {
+   "name": "logs",
+   "required": false,
+   "isInput": false,
+   "isOutput": true,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "object"
+   },
+   "value": "{}"
+  },
+  {
+   "name": "assessment_payload",
+   "required": false,
+   "isInput": false,
+   "isOutput": true,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "array"
+   },
+   "value": "[]"
+  },
+  {
+   "name": "file_name",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"\""
+  },
+  {
+   "name": "watson_model_id",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"ibm/granite-3-2-8b-instruct\""
+  },
+  {
+   "name": "grype_scan_report",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"\""
+  },
+  {
+   "name": "grype_file_name",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"\""
+  },
+  {
+   "name": "combined_scan_report",
+   "required": false,
+   "isInput": false,
+   "isOutput": true,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"\""
+  },
+  {
+   "name": "host_list",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "array"
+   },
+   "value": "[]"
+  },
+  {
+   "name": "runtime_dict",
+   "required": false,
+   "isInput": false,
+   "isOutput": true,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "object"
+   },
+   "value": "{}"
+  },
+  {
+   "name": "deploysbom",
+   "required": false,
+   "isInput": false,
+   "isOutput": true,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "object"
+   },
+   "value": "{}"
+  },
+  {
+   "name": "app_sbom",
+   "required": false,
+   "isInput": false,
+   "isOutput": true,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "object"
+   },
+   "value": "{}"
+  },
+  {
+   "name": "application_name",
+   "required": false,
+   "isInput": true,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"php-portal\""
+  },
+  {
+   "name": "application_version",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"1.0.0\""
+  },
+  {
+   "name": "create_app_deploy_sbom",
+   "required": false,
+   "isInput": true,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "boolean"
+   },
+   "value": "false"
+  }
+ ],
+ "meta": {
+  "workerGroup": "default",
+  "created": 1793026845879,
+  "lastUpdated": 1793026845879,
+  "description": "Copy of IBM's RHEL_SCAN_OSCAP_GRYPE (v2.2 sample) without the Grype step: scans RHEL machines over SSH with OpenSCAP against Red Hat's OVAL feed, converts the report to Concert's vm_scan CSV and ingests it. create_app_deploy_sbom defaults to false because php-portal's application and deploy SBOMs are loaded separately (re-sending an application SBOM without its components disassociates them).",
+  "layout": "flow",
+  "updatedByUsername": "concertuser",
+  "numberOfBlocks": 41,
+  "version": 5,
+  "tags": [
+   {
+    "name": "Consumer",
+    "value": "Concert"
+   },
+   {
+    "name": "Concert version",
+    "value": "2.3.0"
+   },
+   {
+    "name": "Category",
+    "value": "Vulnerability"
+   }
+  ]
+ }
+}

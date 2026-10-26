@@ -1,0 +1,249 @@
+{
+ "name": "Remediate_PHP2Shell",
+ "platform": "node",
+ "blocks": [
+  {
+   "action": "comment",
+   "value": "Remediates PHP2Shell (CVE-2026-109618, CVE-2026-109619) on php-portal. Concert is the orchestrator: (1) Pause - native approval gate, an authorized approver resumes (approve) or stops (reject) the run; (2) Concert launches AWX Job Template 14 Remediate-PHP2Shell, which builds the PHP 8.4.27 image from git, rolls it out on OpenShift, rescans it with Trivy and uploads the scan and the updated deploy SBOM to Concert, then waits until both CVEs are closed; (3) Concert polls the AWX job, collects its stdout and reports. Who can run and approve is Concert Workflows RBAC; every run is audited."
+  },
+  {
+   "action": "assign",
+   "name": "MarkAwaitingApproval",
+   "variable": "$result",
+   "value": "{\"application\": $application, \"cves\": $cve_ids, \"decision\": \"awaiting human approval in Concert\"}"
+  },
+  {
+   "action": "system/Common/Pause",
+   "name": "PauseForApproval"
+  },
+  {
+   "action": "system/Ansible/Tower/Job Templates/Job Templates Launch Create",
+   "name": "LaunchAWX",
+   "inputs": [
+    {
+     "name": "authKey",
+     "value": "$awx_authkey"
+    },
+    {
+     "name": "id",
+     "value": "$job_template_id"
+    },
+    {
+     "name": "data",
+     "value": "{\"extra_vars\": {\"php_target\": \"fixed\"}}"
+    }
+   ]
+  },
+  {
+   "action": "assign",
+   "name": "SetJobId",
+   "variable": "$job_id",
+   "value": "String($LaunchAWX.result.id)"
+  },
+  {
+   "action": "while",
+   "name": "PollJob",
+   "condition": "!$poll_done && $attempts < 180",
+   "blocks": [
+    {
+     "action": "system/Ansible/Tower/Jobs/Jobs Read 0",
+     "name": "ReadJob",
+     "inputs": [
+      {
+       "name": "authKey",
+       "value": "$awx_authkey"
+      },
+      {
+       "name": "id",
+       "value": "$job_id"
+      }
+     ]
+    },
+    {
+     "action": "assign",
+     "name": "SetJobStatus",
+     "variable": "$job_status",
+     "value": "$ReadJob.result.status"
+    },
+    {
+     "action": "assign",
+     "name": "SetPollDone",
+     "variable": "$poll_done",
+     "value": "($job_status == 'successful' || $job_status == 'failed' || $job_status == 'error' || $job_status == 'canceled')"
+    },
+    {
+     "action": "assign",
+     "name": "IncAttempts",
+     "variable": "$attempts",
+     "value": "$attempts + 1"
+    },
+    {
+     "action": "system/Common/Sleep",
+     "name": "PollSleep",
+     "inputs": [
+      {
+       "name": "seconds",
+       "value": "10"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "action": "system/Ansible/Tower/Jobs/Jobs Stdout Read",
+   "name": "ReadStdout",
+   "inputs": [
+    {
+     "name": "authKey",
+     "value": "$awx_authkey"
+    },
+    {
+     "name": "id",
+     "value": "$job_id"
+    }
+   ]
+  },
+  {
+   "action": "if",
+   "name": "CheckJob",
+   "condition": "$job_status == 'successful'",
+   "then": [
+    {
+     "action": "assign",
+     "name": "ResultOk",
+     "variable": "$result",
+     "value": "{\"application\": $application, \"cves\": $cve_ids, \"decision\": \"remediated - approved in Concert, PHP 8.4.27 rolled out and rescanned via AWX\", \"awx_job_id\": $job_id, \"status\": $job_status, \"polls\": $attempts, \"stdout\": $ReadStdout.result}"
+    }
+   ],
+   "else": [
+    {
+     "action": "assign",
+     "name": "ResultFailed",
+     "variable": "$result",
+     "value": "{\"application\": $application, \"decision\": \"AWX job did not succeed\", \"awx_job_id\": $job_id, \"status\": $job_status, \"polls\": $attempts, \"stdout\": $ReadStdout.result}"
+    }
+   ]
+  }
+ ],
+ "variables": [
+  {
+   "name": "awx_authkey",
+   "required": true,
+   "isInput": true,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"concertuser/AWX-Demo\""
+  },
+  {
+   "name": "job_template_id",
+   "required": true,
+   "isInput": true,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"14\""
+  },
+  {
+   "name": "application",
+   "required": false,
+   "isInput": true,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"php-portal\""
+  },
+  {
+   "name": "cve_ids",
+   "required": false,
+   "isInput": true,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"CVE-2026-109618, CVE-2026-109619\""
+  },
+  {
+   "name": "job_id",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"\""
+  },
+  {
+   "name": "job_status",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"\""
+  },
+  {
+   "name": "poll_done",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "boolean"
+   },
+   "value": "false"
+  },
+  {
+   "name": "attempts",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "number"
+   },
+   "value": "0"
+  },
+  {
+   "name": "result",
+   "required": false,
+   "isInput": false,
+   "isOutput": true,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "any"
+   },
+   "value": "\"\""
+  }
+ ],
+ "meta": {
+  "workerGroup": "default",
+  "created": 1793028174371,
+  "lastUpdated": 1793028174371,
+  "description": "PHP2Shell (CVE-2026-109618, CVE-2026-109619) remediation for php-portal: native approval (Common/Pause) -> AWX Job Template 14 Remediate-PHP2Shell (build PHP 8.4.27, roll out, Trivy rescan, report to Concert) -> poll -> stdout -> result. Concert orchestrates and governs; AWX only executes.",
+  "layout": "flow",
+  "updatedByUsername": "concertuser",
+  "numberOfBlocks": 15,
+  "version": 5,
+  "tags": [
+   {
+    "name": "Consumer",
+    "value": "Concert"
+   },
+   {
+    "name": "Category",
+    "value": "Remediation"
+   }
+  ]
+ }
+}

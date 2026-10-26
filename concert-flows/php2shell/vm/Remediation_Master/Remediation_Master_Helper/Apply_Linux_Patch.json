@@ -1,0 +1,254 @@
+{
+ "name": "Apply_Linux_Patch",
+ "platform": "node",
+ "hash": "jmRp6vxTXZEJ/a+4E6T7IvGqoiqfB6qicBbu8taR9tU=",
+ "blocks": [
+  {
+   "action": "system/Common/Config Data/Get Config Data",
+   "name": "GetConfigData_1",
+   "inputs": [
+    {
+     "name": "authKey",
+     "value": "$ConfigDataAuth"
+    }
+   ]
+  },
+  {
+   "action": "comment",
+   "value": "Function to parse input JSON to map machine name along with RHSA numbers.Also fetch the Auths from the configdata"
+  },
+  {
+   "name": "Function_1",
+   "function": "function processRhsaAdvisories(inputJson) {\n    let result = {};\n\n    for (let recommendation of inputJson[\"recommendations\"]) {\n        let hostName = recommendation[\"environment\"][\"host_name\"];\n        let advisories = [];\n\n        for (let severity of [\"critical\", \"high\", \"medium\", \"low\"]) {\n            for (let patch of recommendation[\"patches\"][severity]) {\n                advisories.push(patch[\"advisory\"]);\n            }\n        }\n\n        result[hostName] = advisories;\n    }\n\n    return result;\n};\n\n$patchesToApply = processRhsaAdvisories($input_json_data);\nconst patchHosts = Object.keys($patchesToApply);\n$auth_list = $GetConfigData_1.result.config.filter(entry => entry.host.some(h => patchHosts.includes(h))).map(entry => entry.auth);\n\n$auth_host_map = $GetConfigData_1.result.config.reduce((map, item) => {\n    map[item.auth] = item.host;\n    return map;\n}, {});\n\n$skipped_hosts = $GetConfigData_1.result.config.flatMap(entry => entry.host).filter(h => !patchHosts.includes(h))"
+  },
+  {
+   "action": "foreach",
+   "name": "ForEachAuth",
+   "list": "$auth_list",
+   "blocks": [
+    {
+     "action": "try",
+     "name": "Try_1",
+     "try": [
+      {
+       "action": "system/Ansible/Playbook",
+       "name": "ApplyPatchesIdentified",
+       "inputs": [
+        {
+         "name": "authKey",
+         "value": "$ForEachAuth.item"
+        },
+        {
+         "name": "playbook",
+         "value": "`---\n- name: \"Stage 1: Patch Canary Machines\"\n  hosts: canary\n  gather_facts: yes\n  become: true\n  \n  vars:\n    patch_data: ${JSON.stringify($patchesToApply)}\n  \n  tasks:\n    - name: Print the current host\n      debug:\n        msg: \"Running on host: {{ inventory_hostname }}\"\n        \n    - name: Get advisories for this host\n      set_fact:\n        current_host_advisories: \"{{ patch_data[inventory_hostname] | default([]) }}\"\n        \n    - name: Print advisories for this host\n      debug:\n        msg: \"Advisories for this host: {{ current_host_advisories }}\"\n\n    - block:\n        - name: Gather list of advisories BEFORE update\n          command: dnf updateinfo list available\n          register: advisories_before\n          changed_when: false\n          become: true\n\n        - name: Apply patches if available for this host\n          command: \"dnf update -y --advisory={{ item }}\"\n          loop: \"{{ current_host_advisories }}\"\n          register: patch_output\n          when: current_host_advisories | length > 0\n          become: yes\n        \n        - name: Restart the services that load the patched packages (this copy does not reboot the host)\n          service:\n            name: \"{{ item }}\"\n            state: restarted\n          loop: [php-fpm, httpd]\n          when: patch_output is changed\n          become: yes\n\n        - name: Gather list of advisories AFTER update\n          command: dnf updateinfo list available\n          register: advisories_after\n          changed_when: false\n          become: true\n\n        - name: Determine advisories that were applied from input list (no duplicates)\n          set_fact:\n            applied_advisories: >-\n              {{\n                advisories_before.stdout_lines\n                | difference(advisories_after.stdout_lines)\n                | map('regex_search', '^(RH[A-Z]+-[0-9]+:[0-9]+)')\n                | select('string')\n                | list\n                | select('in', current_host_advisories)\n                | unique\n              }}\n\n        - name: Record applied advisories\n          set_fact:\n            patch_status:\n              status: \"success\"\n              applied_advisories: \"{{ applied_advisories }}\"\n    \n      rescue:\n      - name: Set patch status on failure\n        set_fact:\n          patch_status:\n            status: \"failed\"\n            reason: \"{{ ansible_failed_result.msg | default('Unknown error') }}\"\n            applied_advisories: []\n\n- name: \"Generate Patch Summary Report\"\n  hosts: localhost\n  gather_facts: no\n  vars:\n    skipped_hosts: ${JSON.stringify($skipped_hosts)}\n  tasks:\n    - name: Generate patch summary dictionary\n      set_fact:\n        patch_summary: >-\n          {{\n            dict(\n              hostvars\n              | dict2items\n              | rejectattr('key', 'in', skipped_hosts)\n              | selectattr('value.patch_status', 'defined')\n              | map(attribute='key')\n              | zip(\n                  hostvars\n                  | dict2items\n                  | rejectattr('key', 'in', skipped_hosts)\n                  | selectattr('value.patch_status', 'defined')\n                  | map(attribute='value.patch_status')\n                )\n            )\n          }}\n    \n    - name: Print patch summary\n      debug:\n        var: patch_summary\n  \n`"
+        }
+       ]
+      },
+      {
+       "action": "comment",
+       "value": "Execute the Ansible playbook to apply RHSA patches on identified Red Hat VMs. Canary machines are patched first before rolling out to all systems."
+      },
+      {
+       "action": "if",
+       "name": "If_1",
+       "condition": "($ApplyPatchesIdentified && $ApplyPatchesIdentified.result && $ApplyPatchesIdentified.result[\"plays\"] && $ApplyPatchesIdentified.result[\"plays\"][1] && $ApplyPatchesIdentified.result[\"plays\"][1][\"tasks\"] && $ApplyPatchesIdentified.result[\"plays\"][1][\"tasks\"][1] && Object.keys($ApplyPatchesIdentified.result[\"plays\"][1][\"tasks\"][1]).length > 0)",
+       "then": [
+        {
+         "action": "system/Common/Array/Array Push",
+         "name": "add_to_patch_summary_list",
+         "inputs": [
+          {
+           "name": "array",
+           "value": "$patch_summary.patch_summary_report"
+          },
+          {
+           "name": "item",
+           "value": "$ApplyPatchesIdentified.result[\"plays\"][1][\"tasks\"][1]"
+          }
+         ]
+        }
+       ],
+       "else": [
+        {
+         "action": "system/Common/Array/Array Push",
+         "name": "add_failure_to_summary",
+         "inputs": [
+          {
+           "name": "array",
+           "value": "$failure_summary.failure_summary_report"
+          },
+          {
+           "name": "item",
+           "value": "$ApplyPatchesIdentified.error"
+          }
+         ]
+        },
+        {
+         "name": "Function_2",
+         "function": "const response = {\n  \"hostIps\": $auth_host_map[$ForEachAuth.item],\n  \"err\": $ApplyPatchesIdentified.error\n}\n$patch_summary.patch_summary_report.push(\n  response\n)"
+        }
+       ]
+      }
+     ],
+     "catch": []
+    }
+   ]
+  },
+  {
+   "action": "assign",
+   "name": "PatchSummary",
+   "variable": "$result1",
+   "value": "$patch_summary"
+  },
+  {
+   "action": "assign",
+   "name": "Skipped_summary",
+   "variable": "$skipped_summary",
+   "value": "$skipped_hosts.map(host => ({\n    host,\n    status: \"skipped\",\n    reason: \"patches are not required\"\n}))"
+  },
+  {
+   "action": "assign",
+   "name": "FailedSummary",
+   "variable": "$result2",
+   "value": "$failure_summary"
+  }
+ ],
+ "variables": [
+  {
+   "name": "input_json_data",
+   "required": true,
+   "isInput": true,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "object"
+   },
+   "value": "{}"
+  },
+  {
+   "name": "ConfigDataAuth",
+   "required": true,
+   "isInput": true,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"\"",
+   "meta": {
+    "authType": "ANY",
+    "subType": "authentication"
+   }
+  },
+  {
+   "name": "patchesToApply",
+   "required": false,
+   "isInput": false,
+   "isOutput": true,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "object"
+   },
+   "value": "{}"
+  },
+  {
+   "name": "result1",
+   "required": false,
+   "isInput": false,
+   "isOutput": true,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"\""
+  },
+  {
+   "name": "result2",
+   "required": false,
+   "isInput": false,
+   "isOutput": true,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"\""
+  },
+  {
+   "name": "auth_list",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "array"
+   },
+   "value": "[]"
+  },
+  {
+   "name": "patch_summary",
+   "required": false,
+   "isInput": false,
+   "isOutput": true,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "object"
+   },
+   "value": "{\n    \"patch_summary_report\": []\n}"
+  },
+  {
+   "name": "failure_summary",
+   "required": false,
+   "isInput": false,
+   "isOutput": true,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "object"
+   },
+   "value": "{\n    \"failure_summary_report\": []\n}"
+  },
+  {
+   "name": "skipped_hosts",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "array"
+   },
+   "value": "[]"
+  },
+  {
+   "name": "skipped_summary",
+   "required": false,
+   "isInput": false,
+   "isOutput": true,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "any"
+   },
+   "value": "\"\""
+  },
+  {
+   "name": "auth_host_map",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "object"
+   },
+   "value": "{}"
+  }
+ ],
+ "meta": {
+  "workerGroup": "default",
+  "created": 1771286145901,
+  "lastUpdated": 1793026845879,
+  "description": "This workflow automates the application of RHSA patches to Red Hat VMs. From the input_json, it  applies relevant advisory patches via Ansible to all the required machines, and reboots the machines as needed. MODIFIED COPY for the php-portal demo: restarts php-fpm and httpd instead of rebooting the host (the demo VM is a shared bastion).",
+  "layout": "flow",
+  "updatedByUsername": "concertuser",
+  "numberOfBlocks": 14,
+  "version": 5
+ },
+ "finally": null
+}

@@ -1,0 +1,239 @@
+{
+ "name": "Reset_PHP2Shell_Demo",
+ "platform": "node",
+ "blocks": [
+  {
+   "action": "comment",
+   "value": "Demo reset for php-portal: launches AWX Job Template 15 (Reset-PHP2Shell-Demo), which rebuilds and rolls out the PHP 8.4.24 image, rescans it with Trivy and reports it to Concert, so CVE-2026-109618 and CVE-2026-109619 are open again before the next run of Remediate_PHP2Shell."
+  },
+  {
+   "action": "system/Ansible/Tower/Job Templates/Job Templates Launch Create",
+   "name": "LaunchAWX",
+   "inputs": [
+    {
+     "name": "authKey",
+     "value": "$awx_authkey"
+    },
+    {
+     "name": "id",
+     "value": "$job_template_id"
+    },
+    {
+     "name": "data",
+     "value": "{\"extra_vars\": {\"php_target\": \"vulnerable\"}}"
+    }
+   ]
+  },
+  {
+   "action": "assign",
+   "name": "SetJobId",
+   "variable": "$job_id",
+   "value": "String($LaunchAWX.result.id)"
+  },
+  {
+   "action": "while",
+   "name": "PollJob",
+   "condition": "!$poll_done && $attempts < 180",
+   "blocks": [
+    {
+     "action": "system/Ansible/Tower/Jobs/Jobs Read 0",
+     "name": "ReadJob",
+     "inputs": [
+      {
+       "name": "authKey",
+       "value": "$awx_authkey"
+      },
+      {
+       "name": "id",
+       "value": "$job_id"
+      }
+     ]
+    },
+    {
+     "action": "assign",
+     "name": "SetJobStatus",
+     "variable": "$job_status",
+     "value": "$ReadJob.result.status"
+    },
+    {
+     "action": "assign",
+     "name": "SetPollDone",
+     "variable": "$poll_done",
+     "value": "($job_status == 'successful' || $job_status == 'failed' || $job_status == 'error' || $job_status == 'canceled')"
+    },
+    {
+     "action": "assign",
+     "name": "IncAttempts",
+     "variable": "$attempts",
+     "value": "$attempts + 1"
+    },
+    {
+     "action": "system/Common/Sleep",
+     "name": "PollSleep",
+     "inputs": [
+      {
+       "name": "seconds",
+       "value": "10"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "action": "system/Ansible/Tower/Jobs/Jobs Stdout Read",
+   "name": "ReadStdout",
+   "inputs": [
+    {
+     "name": "authKey",
+     "value": "$awx_authkey"
+    },
+    {
+     "name": "id",
+     "value": "$job_id"
+    }
+   ]
+  },
+  {
+   "action": "if",
+   "name": "CheckJob",
+   "condition": "$job_status == 'successful'",
+   "then": [
+    {
+     "action": "assign",
+     "name": "ResultOk",
+     "variable": "$result",
+     "value": "{\"application\": $application, \"cves\": $cve_ids, \"decision\": \"demo reset - PHP 8.4.24 rolled out and rescanned via AWX\", \"awx_job_id\": $job_id, \"status\": $job_status, \"polls\": $attempts, \"stdout\": $ReadStdout.result}"
+    }
+   ],
+   "else": [
+    {
+     "action": "assign",
+     "name": "ResultFailed",
+     "variable": "$result",
+     "value": "{\"application\": $application, \"decision\": \"AWX job did not succeed\", \"awx_job_id\": $job_id, \"status\": $job_status, \"polls\": $attempts, \"stdout\": $ReadStdout.result}"
+    }
+   ]
+  }
+ ],
+ "variables": [
+  {
+   "name": "awx_authkey",
+   "required": true,
+   "isInput": true,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"concertuser/AWX-Demo\""
+  },
+  {
+   "name": "job_template_id",
+   "required": true,
+   "isInput": true,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"15\""
+  },
+  {
+   "name": "application",
+   "required": false,
+   "isInput": true,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"php-portal\""
+  },
+  {
+   "name": "cve_ids",
+   "required": false,
+   "isInput": true,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"CVE-2026-109618, CVE-2026-109619\""
+  },
+  {
+   "name": "job_id",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"\""
+  },
+  {
+   "name": "job_status",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"\""
+  },
+  {
+   "name": "poll_done",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "boolean"
+   },
+   "value": "false"
+  },
+  {
+   "name": "attempts",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "number"
+   },
+   "value": "0"
+  },
+  {
+   "name": "result",
+   "required": false,
+   "isInput": false,
+   "isOutput": true,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "any"
+   },
+   "value": "\"\""
+  }
+ ],
+ "meta": {
+  "workerGroup": "default",
+  "created": 1793028174371,
+  "lastUpdated": 1793028174371,
+  "description": "Resets the PHP2Shell demo: AWX Job Template 15 Reset-PHP2Shell-Demo puts php-portal back on PHP 8.4.24, rescans and reports to Concert so CVE-2026-109618/109619 are open again.",
+  "layout": "flow",
+  "updatedByUsername": "concertuser",
+  "numberOfBlocks": 13,
+  "version": 5,
+  "tags": [
+   {
+    "name": "Consumer",
+    "value": "Concert"
+   },
+   {
+    "name": "Category",
+    "value": "Remediation"
+   }
+  ]
+ }
+}
