@@ -216,6 +216,22 @@
       ansible.builtin.set_fact:
         php2shell_in_scan: "{{ cdx.vulnerabilities | default([]) | map(attribute='id') | select('in', php2shell_cves) | list }}"
 
+    - name: Find the application in Concert
+      ansible.builtin.uri:
+        url: "{{ concert_url }}/core/api/v2/applications?filter=versions:all&page_size=2000"
+        headers: "{{ concert_headers }}"
+      register: apps
+
+    - name: Record PHP2Shell findings in Concert before the upload
+      ansible.builtin.uri:
+        url: "{{ concert_url }}/core/api/v1/applications/{{ (apps.json.applications | selectattr('name', 'equalto', concert_app) | first).id }}/cves"
+        headers: "{{ concert_headers }}"
+      register: cves_before
+
+    - name: Count them
+      ansible.builtin.set_fact:
+        php2shell_before: "{{ cves_before.json.cves | default([]) | selectattr('cve', 'in', php2shell_cves) | map(attribute='total_findings') | sum }}"
+
     # 4. Report to Concert, one document at a time, checking the real processing status and retrying
     #    (Concert's internal jobs at even UTC hours can make a single ingestion fail transiently).
     - name: Build the updated deploy SBOM (new image digest, no deploy-number = update)
@@ -314,24 +330,19 @@
         that: concert_upload_status == 'processing_completed'
         fail_msg: "Concert could not process the scan: {{ concert_upload_details }}"
 
-    # 5. Verify in Concert (a 202 only means "accepted": wait for the data itself)
-    - name: Find the application in Concert
-      ansible.builtin.uri:
-        url: "{{ concert_url }}/core/api/v2/applications?filter=versions:all&page_size=2000"
-        headers: "{{ concert_headers }}"
-      register: apps
-
+    # 5. Verify in Concert. php-portal has two environments (OpenShift and the RHEL VM), so the application keeps
+    #    PHP2Shell findings while the VM is unpatched: compare this image's effect (before vs after the upload).
     - name: Wait until Concert reflects the scan
       ansible.builtin.uri:
         url: "{{ concert_url }}/core/api/v1/applications/{{ (apps.json.applications | selectattr('name', 'equalto', concert_app) | first).id }}/cves"
         headers: "{{ concert_headers }}"
       register: app_cves
       vars:
-        open_php2shell: "{{ app_cves.json.cves | default([]) | map(attribute='cve') | select('in', php2shell_cves) | list }}"
+        php2shell_after: "{{ app_cves.json.cves | default([]) | selectattr('cve', 'in', php2shell_cves) | map(attribute='total_findings') | sum }}"
       until: >-
         app_cves.status == 200 and
-        ((php_target == 'fixed' and open_php2shell | length == 0) or
-         (php_target == 'vulnerable' and open_php2shell | length == php2shell_cves | length))
+        ((php_target == 'fixed' and (php2shell_after | int < php2shell_before | int or php2shell_before | int == 0)) or
+         (php_target == 'vulnerable' and php2shell_after | int >= php2shell_before | int and php2shell_after | int > 0))
       retries: 30
       delay: 10
 
@@ -341,5 +352,6 @@
           {{ 'REMEDIATED' if php_target == 'fixed' else 'RESET' }} {{ concert_app }} (OpenShift):
           PHP {{ t.php }} image {{ image_ref }};
           PHP2Shell in new scan: {{ php2shell_in_scan | join(',') if php2shell_in_scan else 'none' }};
-          Concert open CVEs: {{ app_cves.json.cves | length }};
-          Concert PHP2Shell open: {{ app_cves.json.cves | map(attribute='cve') | select('in', php2shell_cves) | join(',') or 'none' }}
+          Concert open CVEs (whole app): {{ app_cves.json.cves | length }};
+          PHP2Shell findings in Concert: {{ php2shell_before }} before -> {{ app_cves.json.cves | selectattr('cve', 'in', php2shell_cves) | map(attribute='total_findings') | sum }} after
+          (the rest belong to the RHEL VM copy)
