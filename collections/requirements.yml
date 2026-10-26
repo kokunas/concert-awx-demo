@@ -7,4 +7,4 @@ collections:
   - name: amazon.aws
     version: ">=8.0.0"
   - name: kubernetes.core
-    version: ">=3.0.0"
+    version: ">=3.0.0,<6.0.0"   # 6.x requires ansible-core >= 2.16; awx-ee 24.6.1 ships 2.15
