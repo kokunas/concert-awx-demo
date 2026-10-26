@@ -18,15 +18,18 @@
     demo_ns: php-cve-demo
     deployment: php-cve-demo
     targets:
-      fixed: {buildconfig: php-cve-demo-fixed, tag: "1.0.1", php: "8.4.27"}
-      vulnerable: {buildconfig: php-cve-demo, tag: "1.0.0", php: "8.4.24"}
+      fixed: {buildconfig: php-portal-fixed, tag: "1.0.1", php: "8.4.27"}
+      vulnerable: {buildconfig: php-portal, tag: "1.0.0", php: "8.4.24"}
     t: "{{ targets[php_target] }}"
     registry: image-registry.openshift-image-registry.svc:5000
-    concert_app: php-cve-demo
+    concert_app: php-portal
     concert_app_version: "1.0.0"
-    concert_env: itz-r87cnx-demo
-    concert_repo_name: php-cve-demo-image
-    concert_repo_url: "{{ registry }}/{{ demo_ns }}/php-cve-demo"
+    concert_env: php-portal-public
+    concert_component: php-portal-web
+    concert_image: php-portal
+    concert_deploy_name: php-portal-openshift
+    concert_repo_name: php-portal-image
+    concert_repo_url: "{{ registry }}/{{ demo_ns }}/{{ concert_image }}"
     php2shell_cves: [CVE-2026-109618, CVE-2026-109619]
     k8s_host: "{{ lookup('env', 'K8S_AUTH_HOST') }}"
     k8s_token: "{{ lookup('env', 'K8S_AUTH_API_KEY') }}"
@@ -75,11 +78,11 @@
 
     - name: Record the new image digest
       ansible.builtin.set_fact:
-        image_ref: "{{ registry }}/{{ demo_ns }}/php-cve-demo@{{ build.resources[0].status.output.to.imageDigest }}"
+        image_ref: "{{ registry }}/{{ demo_ns }}/{{ concert_image }}@{{ build.resources[0].status.output.to.imageDigest }}"
 
     # 2. Roll it out
     # The image is pinned by digest and the ImageStream trigger is removed, so only this job decides what runs.
-    - name: Point the deployment at php-cve-demo:{{ t.tag }} ({{ image_ref }})
+    - name: Point the deployment at {{ concert_image }}:{{ t.tag }} ({{ image_ref }})
       kubernetes.core.k8s:
         state: patched
         api_version: apps/v1
@@ -213,44 +216,17 @@
       ansible.builtin.set_fact:
         php2shell_in_scan: "{{ cdx.vulnerabilities | default([]) | map(attribute='id') | select('in', php2shell_cves) | list }}"
 
-    - name: Write the report
-      ansible.builtin.copy:
-        content: "{{ cdx | to_json }}"
-        dest: /tmp/php-cve-demo-scan.cdx.json
-        mode: "0600"
-
-    # 4. Report to Concert
-    - name: Upload the scan to Concert (code_scan)
-      ansible.builtin.uri:
-        url: "{{ concert_url }}/ingestion/api/v1/upload_files"
-        method: POST
-        headers: "{{ concert_headers }}"
-        body_format: form-multipart
-        body:
-          data_type: code_scan
-          metadata: >-
-            {{ {'repo_url': concert_repo_url, 'repo_name': concert_repo_name, 'scanner_name': 'trivy',
-                'application_name': concert_app, 'application_version': concert_app_version,
-                'env_name': concert_env} | to_json }}
-          filename:
-            filename: /tmp/php-cve-demo-scan.cdx.json
-            mime_type: application/json
-        status_code: [200, 201, 202]
-      register: scan_upload
-
-    - name: Write the updated deploy SBOM (new image digest, no deploy-number = update)
-      ansible.builtin.copy:
-        dest: /tmp/php-cve-demo-deploy-sbom.json
-        mode: "0600"
-        content: "{{ deploy_sbom | to_json }}"
-      vars:
+    # 4. Report to Concert, one document at a time, checking the real processing status and retrying
+    #    (Concert's internal jobs at even UTC hours can make a single ingestion fail transiently).
+    - name: Build the updated deploy SBOM (new image digest, no deploy-number = update)
+      ansible.builtin.set_fact:
         deploy_sbom:
           bomFormat: ConcertDef
           specVersion: "2.0.0"
           metadata:
             timestamp: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
             type: deploy
-            deploy-name: php-cve-demo-itz-r87cnx
+            deploy-name: "{{ concert_deploy_name }}"
             application-name: "{{ concert_app }}"
             application-version: "{{ concert_app_version }}"
           environment:
@@ -273,37 +249,64 @@
                   type: namespace
                   name: "{{ demo_ns }}"
                   components:
-                    - bom-ref: deployment:php-cve-demo-web
+                    - bom-ref: "deployment:{{ concert_component }}"
                       type: deployment
-                      name: php-cve-demo-web
+                      name: "{{ concert_component }}"
                       components:
-                        - {bom-ref: "image:php-cve-demo", type: image, name: php-cve-demo, uri: "{{ image_ref }}"}
+                        - {bom-ref: "image:{{ concert_image }}", type: image, name: "{{ concert_image }}", uri: "{{ image_ref }}"}
                       properties:
                         - {name: workload.type, value: "k8s:Deployment"}
           services:
-            - bom-ref: service:php-cve-demo-web
-              name: php-cve-demo-web
+            - bom-ref: "service:{{ concert_component }}"
+              name: "{{ concert_component }}"
               network_exposure: public
               endpoints: ["/"]
-              base-url: https://php-cve-demo-php-cve-demo.apps.itz-r87cnx.pok-lb.techzone.ibm.com
+              base-url: "https://{{ deployment }}-{{ demo_ns }}.apps.itz-r87cnx.pok-lb.techzone.ibm.com"
               port: 443
           dependencies:
             - {ref: "environment:{{ concert_env }}", dependsOn: ["infra:kubernetes:openshift:itz-r87cnx"]}
-            - {ref: "image:php-cve-demo", dependsOn: ["service:php-cve-demo-web"]}
+            - {ref: "image:{{ concert_image }}", dependsOn: ["service:{{ concert_component }}"]}
           tags: [demo, php2shell]
 
-    - name: Upload the deploy SBOM to Concert
-      ansible.builtin.uri:
-        url: "{{ concert_url }}/ingestion/api/v1/upload_files"
-        method: POST
-        headers: "{{ concert_headers }}"
-        body_format: form-multipart
-        body:
+    - name: Upload the deploy SBOM to Concert (application_sbom)
+      ansible.builtin.include_tasks: tasks/concert_upload.yml
+      loop: [1, 2, 3]
+      loop_control: {loop_var: attempt}
+      when: attempt == 1 or concert_upload_status != 'processing_completed'
+      vars:
+        upload:
+          label: deploy SBOM
           data_type: application_sbom
-          filename:
-            filename: /tmp/php-cve-demo-deploy-sbom.json
-            mime_type: application/json
-        status_code: [200, 201, 202]
+          doc: "{{ deploy_sbom }}"
+
+    - name: Fail if Concert did not ingest the deploy SBOM
+      ansible.builtin.assert:
+        that: concert_upload_status == 'processing_completed'
+        fail_msg: "Concert could not process the deploy SBOM: {{ concert_upload_details }}"
+
+    - name: Upload the scan to Concert (code_scan)
+      ansible.builtin.include_tasks: tasks/concert_upload.yml
+      loop: [1, 2, 3]
+      loop_control: {loop_var: attempt}
+      when: attempt == 1 or concert_upload_status != 'processing_completed'
+      vars:
+        upload:
+          label: Trivy scan
+          data_type: code_scan
+          doc: "{{ cdx }}"
+          fresh_serial: "{{ attempt > 1 }}"
+          metadata:
+            repo_url: "{{ concert_repo_url }}"
+            repo_name: "{{ concert_repo_name }}"
+            scanner_name: trivy
+            application_name: "{{ concert_app }}"
+            application_version: "{{ concert_app_version }}"
+            env_name: "{{ concert_env }}"
+
+    - name: Fail if Concert did not ingest the scan
+      ansible.builtin.assert:
+        that: concert_upload_status == 'processing_completed'
+        fail_msg: "Concert could not process the scan: {{ concert_upload_details }}"
 
     # 5. Verify in Concert (a 202 only means "accepted": wait for the data itself)
     - name: Find the application in Concert
@@ -329,7 +332,7 @@
     - name: Summary for Concert Workflows
       ansible.builtin.debug:
         msg: >-
-          {{ 'REMEDIATED' if php_target == 'fixed' else 'RESET' }} php-cve-demo:
+          {{ 'REMEDIATED' if php_target == 'fixed' else 'RESET' }} {{ concert_app }} (OpenShift):
           PHP {{ t.php }} image {{ image_ref }};
           PHP2Shell in new scan: {{ php2shell_in_scan | join(',') if php2shell_in_scan else 'none' }};
           Concert open CVEs: {{ app_cves.json.cves | length }};
