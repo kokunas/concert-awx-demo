@@ -78,7 +78,8 @@
         image_ref: "{{ registry }}/{{ demo_ns }}/php-cve-demo@{{ build.resources[0].status.output.to.imageDigest }}"
 
     # 2. Roll it out
-    - name: Point the deployment at php-cve-demo:{{ t.tag }}
+    # The image is pinned by digest and the ImageStream trigger is removed, so only this job decides what runs.
+    - name: Point the deployment at php-cve-demo:{{ t.tag }} ({{ image_ref }})
       kubernetes.core.k8s:
         state: patched
         api_version: apps/v1
@@ -88,8 +89,7 @@
         definition:
           metadata:
             annotations:
-              image.openshift.io/triggers: >-
-                [{"from":{"kind":"ImageStreamTag","name":"php-cve-demo:{{ t.tag }}"},"fieldPath":"spec.template.spec.containers[?(@.name==\"web\")].image"}]
+              image.openshift.io/triggers: null
           spec:
             template:
               spec:
