@@ -268,11 +268,14 @@
             - {ref: "image:{{ concert_image }}", dependsOn: ["service:{{ concert_component }}"]}
           tags: [demo, php2shell]
 
+    - name: Reset the upload status
+      ansible.builtin.set_fact:
+        concert_upload_status: pending
+
     - name: Upload the deploy SBOM to Concert (application_sbom)
       ansible.builtin.include_tasks: tasks/concert_upload.yml
       loop: [1, 2, 3]
       loop_control: {loop_var: attempt}
-      when: attempt == 1 or concert_upload_status != 'processing_completed'
       vars:
         upload:
           label: deploy SBOM
@@ -284,11 +287,14 @@
         that: concert_upload_status == 'processing_completed'
         fail_msg: "Concert could not process the deploy SBOM: {{ concert_upload_details }}"
 
+    - name: Reset the upload status
+      ansible.builtin.set_fact:
+        concert_upload_status: pending
+
     - name: Upload the scan to Concert (code_scan)
       ansible.builtin.include_tasks: tasks/concert_upload.yml
       loop: [1, 2, 3]
       loop_control: {loop_var: attempt}
-      when: attempt == 1 or concert_upload_status != 'processing_completed'
       vars:
         upload:
           label: Trivy scan

@@ -3,51 +3,55 @@
 # A 202 only means "accepted" (PECI lesson): the outcome is read from the event log (lz) by lz_path.
 # Inputs: upload (dict: label, data_type, doc, metadata?, fresh_serial?), attempt (int).
 # Output: concert_upload_status (processing_completed | error_processing | timeout), concert_upload_details.
-- name: "Write {{ upload.label }} (attempt {{ attempt }})"
-  ansible.builtin.template:
-    src: json_document.j2
-    dest: "/tmp/concert-upload-{{ upload.data_type }}.json"
-    mode: "0600"
-  vars:
-    upload_doc: >-
-      {{ upload.doc | combine({'serialNumber': 'urn:uuid:' ~ ((upload.label ~ now().isoformat() ~ attempt) | to_uuid)})
-         if upload.fresh_serial | default(false) else upload.doc }}
+# Skipped once a previous attempt succeeded (evaluated per attempt, at run time).
+- name: "{{ upload.label }}: attempt {{ attempt }}"
+  when: concert_upload_status | default('pending') != 'processing_completed'
+  block:
+    - name: "Write {{ upload.label }} (attempt {{ attempt }})"
+      ansible.builtin.template:
+        src: json_document.j2
+        dest: "/tmp/concert-upload-{{ upload.data_type }}.json"
+        mode: "0600"
+      vars:
+        upload_doc: >-
+          {{ upload.doc | combine({'serialNumber': 'urn:uuid:' ~ ((upload.label ~ now().isoformat() ~ attempt) | to_uuid)})
+             if upload.fresh_serial | default(false) else upload.doc }}
 
-- name: "Upload {{ upload.label }} to Concert (attempt {{ attempt }})"
-  ansible.builtin.uri:
-    url: "{{ concert_url }}/ingestion/api/v1/upload_files"
-    method: POST
-    headers: "{{ concert_headers }}"
-    body_format: form-multipart
-    body: >-
-      {{ {'data_type': upload.data_type,
-          'filename': {'filename': '/tmp/concert-upload-' ~ upload.data_type ~ '.json', 'mime_type': 'application/json'}}
-         | combine({'metadata': upload.metadata | to_json} if upload.metadata is defined else {}) }}
-    status_code: [200, 201, 202]
-  register: concert_up
+    - name: "Upload {{ upload.label }} to Concert (attempt {{ attempt }})"
+      ansible.builtin.uri:
+        url: "{{ concert_url }}/ingestion/api/v1/upload_files"
+        method: POST
+        headers: "{{ concert_headers }}"
+        body_format: form-multipart
+        body: >-
+          {{ {'data_type': upload.data_type,
+              'filename': {'filename': '/tmp/concert-upload-' ~ upload.data_type ~ '.json', 'mime_type': 'application/json'}}
+             | combine({'metadata': upload.metadata | to_json} if upload.metadata is defined else {}) }}
+        status_code: [200, 201, 202]
+      register: concert_up
 
-- name: "Wait for Concert to process {{ upload.label }}"
-  ansible.builtin.uri:
-    url: "{{ concert_url }}/ingestion/api/v1/table_of_contents/lz/search"
-    method: POST
-    headers: "{{ concert_headers }}"
-    body_format: json
-    body: {page: 1, page_size: 50}
-  register: concert_lz
-  vars:
-    rec: "{{ concert_lz.json.toc_records | default([]) | selectattr('lz_path', 'equalto', concert_up.json.record_paths[0]) | list }}"
-  until: rec | length > 0 and rec[0].status in ['processing_completed', 'error_processing']
-  retries: 60
-  delay: 10
-  ignore_errors: true
+    - name: "Wait for Concert to process {{ upload.label }}"
+      ansible.builtin.uri:
+        url: "{{ concert_url }}/ingestion/api/v1/table_of_contents/lz/search"
+        method: POST
+        headers: "{{ concert_headers }}"
+        body_format: json
+        body: {page: 1, page_size: 50}
+      register: concert_lz
+      vars:
+        rec: "{{ concert_lz.json.toc_records | default([]) | selectattr('lz_path', 'equalto', concert_up.json.record_paths[0]) | list }}"
+      until: rec | length > 0 and rec[0].status in ['processing_completed', 'error_processing']
+      retries: 60
+      delay: 10
+      ignore_errors: true
 
-- name: "Record the outcome of {{ upload.label }}"
-  ansible.builtin.set_fact:
-    concert_upload_status: "{{ rec[0].status if rec | length > 0 and rec[0].status in ['processing_completed', 'error_processing'] else 'timeout' }}"
-    concert_upload_details: "{{ (rec[0].additional_details | default('')) if rec | length > 0 else 'no event yet' }}"
-  vars:
-    rec: "{{ concert_lz.json.toc_records | default([]) | selectattr('lz_path', 'equalto', concert_up.json.record_paths[0]) | list }}"
+    - name: "Record the outcome of {{ upload.label }}"
+      ansible.builtin.set_fact:
+        concert_upload_status: "{{ rec[0].status if rec | length > 0 and rec[0].status in ['processing_completed', 'error_processing'] else 'timeout' }}"
+        concert_upload_details: "{{ (rec[0].additional_details | default('')) if rec | length > 0 else 'no event yet' }}"
+      vars:
+        rec: "{{ concert_lz.json.toc_records | default([]) | selectattr('lz_path', 'equalto', concert_up.json.record_paths[0]) | list }}"
 
-- name: "Show the outcome of {{ upload.label }}"
-  ansible.builtin.debug:
-    msg: "{{ upload.label }} attempt {{ attempt }}: {{ concert_upload_status }} {{ concert_upload_details }}"
+    - name: "Show the outcome of {{ upload.label }}"
+      ansible.builtin.debug:
+        msg: "{{ upload.label }} attempt {{ attempt }}: {{ concert_upload_status }} {{ concert_upload_details }}"
