@@ -1,0 +1,336 @@
+---
+# PHP2Shell demo (CVE-2026-109618 / CVE-2026-109619) - executor side, launched by IBM Concert Workflows.
+#
+#   php_target=fixed       -> remediate: build PHP 8.4.27 image, roll it out, rescan with Trivy,
+#                             upload the scan + updated deploy SBOM to Concert, wait until the CVEs close.
+#   php_target=vulnerable  -> reset the demo: same steps with the PHP 8.4.24 image (the CVEs reopen).
+#
+# Credentials injected by the AWX job template (nothing embedded here):
+#   "OpenShift or Kubernetes API Bearer Token" -> K8S_AUTH_HOST, K8S_AUTH_API_KEY, K8S_AUTH_SSL_CA_CERT
+#   "IBM Concert API" (custom type)            -> CONCERT_URL, CONCERT_API_KEY, CONCERT_INSTANCE_ID
+- name: PHP2Shell demo - set PHP runtime and report to IBM Concert
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    php_target: fixed
+    demo_ns: php-cve-demo
+    deployment: php-cve-demo
+    targets:
+      fixed: {buildconfig: php-cve-demo-fixed, tag: "1.0.1", php: "8.4.27"}
+      vulnerable: {buildconfig: php-cve-demo, tag: "1.0.0", php: "8.4.24"}
+    t: "{{ targets[php_target] }}"
+    registry: image-registry.openshift-image-registry.svc:5000
+    concert_app: php-cve-demo
+    concert_app_version: "1.0.0"
+    concert_env: itz-r87cnx-demo
+    concert_repo_name: php-cve-demo-image
+    concert_repo_url: "{{ registry }}/{{ demo_ns }}/php-cve-demo"
+    php2shell_cves: [CVE-2026-109618, CVE-2026-109619]
+    k8s_host: "{{ lookup('env', 'K8S_AUTH_HOST') }}"
+    k8s_token: "{{ lookup('env', 'K8S_AUTH_API_KEY') }}"
+    k8s_ca: "{{ lookup('env', 'K8S_AUTH_SSL_CA_CERT') }}"
+    concert_url: "{{ lookup('env', 'CONCERT_URL') }}"
+    concert_headers:
+      Authorization: "C_API_KEY {{ lookup('env', 'CONCERT_API_KEY') }}"
+      InstanceId: "{{ lookup('env', 'CONCERT_INSTANCE_ID') | default('0000-0000-0000-0000', true) }}"
+
+  tasks:
+    - name: Check inputs
+      ansible.builtin.assert:
+        that:
+          - php_target in targets
+          - k8s_host | length > 0
+          - concert_url | length > 0
+        fail_msg: "php_target must be fixed|vulnerable and both credentials must be attached"
+
+    # 1. Build the image from git (BuildConfig with the pinned PHP package version)
+    - name: Start build {{ t.buildconfig }}
+      ansible.builtin.uri:
+        url: "{{ k8s_host }}/apis/build.openshift.io/v1/namespaces/{{ demo_ns }}/buildconfigs/{{ t.buildconfig }}/instantiate"
+        method: POST
+        headers: {Authorization: "Bearer {{ k8s_token }}"}
+        ca_path: "{{ k8s_ca }}"
+        body_format: json
+        body: {kind: BuildRequest, apiVersion: build.openshift.io/v1, metadata: {name: "{{ t.buildconfig }}"}}
+        status_code: [200, 201]
+      register: build_req
+
+    - name: Wait for build {{ build_req.json.metadata.name }}
+      kubernetes.core.k8s_info:
+        api_version: build.openshift.io/v1
+        kind: Build
+        namespace: "{{ demo_ns }}"
+        name: "{{ build_req.json.metadata.name }}"
+      register: build
+      until: build.resources | length > 0 and build.resources[0].status.phase in ['Complete', 'Failed', 'Error', 'Cancelled']
+      retries: 60
+      delay: 10
+
+    - name: Fail if the build did not complete
+      ansible.builtin.assert:
+        that: build.resources[0].status.phase == 'Complete'
+        fail_msg: "Build {{ build_req.json.metadata.name }} ended in {{ build.resources[0].status.phase }}"
+
+    - name: Record the new image digest
+      ansible.builtin.set_fact:
+        image_ref: "{{ registry }}/{{ demo_ns }}/php-cve-demo@{{ build.resources[0].status.output.to.imageDigest }}"
+
+    # 2. Roll it out
+    - name: Point the deployment at php-cve-demo:{{ t.tag }}
+      kubernetes.core.k8s:
+        state: patched
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ demo_ns }}"
+        name: "{{ deployment }}"
+        definition:
+          metadata:
+            annotations:
+              image.openshift.io/triggers: >-
+                [{"from":{"kind":"ImageStreamTag","name":"php-cve-demo:{{ t.tag }}"},"fieldPath":"spec.template.spec.containers[?(@.name==\"web\")].image"}]
+          spec:
+            template:
+              spec:
+                containers:
+                  - name: web
+                    image: "{{ image_ref }}"
+
+    - name: Wait for the rollout
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ demo_ns }}"
+        name: "{{ deployment }}"
+      register: dep
+      until: >-
+        dep.resources[0].status.observedGeneration | default(0) >= dep.resources[0].metadata.generation and
+        dep.resources[0].status.updatedReplicas | default(0) == dep.resources[0].spec.replicas and
+        dep.resources[0].status.availableReplicas | default(0) == dep.resources[0].spec.replicas and
+        dep.resources[0].status.replicas | default(0) == dep.resources[0].spec.replicas
+      retries: 36
+      delay: 5
+
+    - name: Check the web reports PHP {{ t.php }}
+      ansible.builtin.uri:
+        url: "http://{{ deployment }}.{{ demo_ns }}.svc:8080/"
+        return_content: true
+      register: web
+      until: ("PHP " ~ t.php) in web.content
+      retries: 12
+      delay: 5
+
+    # 3. Rescan the running image with Trivy inside the cluster
+    - name: Remove a previous scan job
+      kubernetes.core.k8s:
+        state: absent
+        api_version: batch/v1
+        kind: Job
+        namespace: "{{ demo_ns }}"
+        name: trivy-remediation-scan
+        delete_options: {propagationPolicy: Foreground}
+        wait: true
+
+    - name: Run Trivy against {{ image_ref }}
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: batch/v1
+          kind: Job
+          metadata: {name: trivy-remediation-scan, namespace: "{{ demo_ns }}"}
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 3600
+            template:
+              metadata: {labels: {app: trivy-remediation-scan}}
+              spec:
+                restartPolicy: Never
+                volumes:
+                  - {name: work, emptyDir: {}}
+                  - {name: service-ca, configMap: {name: service-ca}}
+                containers:
+                  - name: trivy
+                    image: docker.io/aquasec/trivy:0.69.3
+                    env:
+                      - {name: TRIVY_CACHE_DIR, value: /work/cache}
+                      - {name: HOME, value: /work}
+                      - {name: TRIVY_USERNAME, value: serviceaccount}
+                      - {name: SSL_CERT_FILE, value: /work/ca.crt}
+                    command: ["sh", "-c"]
+                    args:
+                      - |
+                        set -e
+                        cat /etc/ssl/certs/ca-certificates.crt /service-ca/service-ca.crt > /work/ca.crt
+                        export TRIVY_PASSWORD="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+                        trivy image --quiet --skip-version-check --scanners vuln --format cyclonedx --output /work/scan.cdx.json "{{ image_ref }}" >/dev/null 2>&1
+                        echo '<<<CDX'
+                        cat /work/scan.cdx.json
+                        echo
+                        echo 'CDX>>>'
+                    volumeMounts:
+                      - {name: work, mountPath: /work}
+                      - {name: service-ca, mountPath: /service-ca}
+                    resources:
+                      requests: {cpu: 200m, memory: 512Mi}
+                      limits: {memory: 2Gi}
+                    securityContext:
+                      allowPrivilegeEscalation: false
+                      capabilities: {drop: [ALL]}
+
+    - name: Wait for the scan
+      kubernetes.core.k8s_info:
+        api_version: batch/v1
+        kind: Job
+        namespace: "{{ demo_ns }}"
+        name: trivy-remediation-scan
+      register: scan_job
+      until: (scan_job.resources[0].status.succeeded | default(0)) > 0 or (scan_job.resources[0].status.failed | default(0)) > 0
+      retries: 60
+      delay: 10
+
+    - name: Fail if the scan failed
+      ansible.builtin.assert:
+        that: (scan_job.resources[0].status.succeeded | default(0)) > 0
+        fail_msg: Trivy scan job failed
+
+    - name: Read the scan report
+      kubernetes.core.k8s_log:
+        namespace: "{{ demo_ns }}"
+        label_selectors: ["app=trivy-remediation-scan"]
+      register: scan_log
+
+    # Concert rules (PECI/PGCM/PRSI lessons): CycloneDX 1.5, component type "application" for a code_scan,
+    # a fresh serialNumber per upload (Trivy generates one), and full scan metadata.
+    - name: Prepare the report for Concert
+      ansible.builtin.set_fact:
+        cdx: >-
+          {{ (scan_log.log | regex_search('(?s)<<<CDX\n(.*)\nCDX>>>', '\1') | first | from_json)
+             | combine({'specVersion': '1.5', '$schema': 'http://cyclonedx.org/schema/bom-1.5.schema.json'})
+             | combine({'metadata': {'component': {'type': 'application'}}}, recursive=True) }}
+
+    - name: Count PHP2Shell findings in the new scan
+      ansible.builtin.set_fact:
+        php2shell_in_scan: "{{ cdx.vulnerabilities | default([]) | map(attribute='id') | select('in', php2shell_cves) | list }}"
+
+    - name: Write the report
+      ansible.builtin.copy:
+        content: "{{ cdx | to_json }}"
+        dest: /tmp/php-cve-demo-scan.cdx.json
+        mode: "0600"
+
+    # 4. Report to Concert
+    - name: Upload the scan to Concert (code_scan)
+      ansible.builtin.uri:
+        url: "{{ concert_url }}/ingestion/api/v1/upload_files"
+        method: POST
+        headers: "{{ concert_headers }}"
+        body_format: form-multipart
+        body:
+          data_type: code_scan
+          metadata: >-
+            {{ {'repo_url': concert_repo_url, 'repo_name': concert_repo_name, 'scanner_name': 'trivy',
+                'application_name': concert_app, 'application_version': concert_app_version,
+                'env_name': concert_env} | to_json }}
+          filename:
+            filename: /tmp/php-cve-demo-scan.cdx.json
+            mime_type: application/json
+        status_code: [200, 201, 202]
+      register: scan_upload
+
+    - name: Write the updated deploy SBOM (new image digest, no deploy-number = update)
+      ansible.builtin.copy:
+        dest: /tmp/php-cve-demo-deploy-sbom.json
+        mode: "0600"
+        content: "{{ deploy_sbom | to_json }}"
+      vars:
+        deploy_sbom:
+          bomFormat: ConcertDef
+          specVersion: "2.0.0"
+          metadata:
+            timestamp: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+            type: deploy
+            deploy-name: php-cve-demo-itz-r87cnx
+            application-name: "{{ concert_app }}"
+            application-version: "{{ concert_app_version }}"
+          environment:
+            bom-ref: "environment:{{ concert_env }}"
+            name: "{{ concert_env }}"
+            purpose: production
+            type: kubernetes
+            tags: [demo]
+          runtime-components:
+            - bom-ref: "infra:kubernetes:openshift:itz-r87cnx"
+              name: itz-r87cnx
+              type: kubernetes
+              api-server: https://api.itz-r87cnx.pok-lb.techzone.ibm.com:6443
+              properties:
+                - {name: platform, value: openshift}
+                - {name: cluster_platform, value: techzone}
+                - {name: cluster_name, value: itz-r87cnx}
+              components:
+                - bom-ref: "namespace:{{ demo_ns }}"
+                  type: namespace
+                  name: "{{ demo_ns }}"
+                  components:
+                    - bom-ref: deployment:php-cve-demo-web
+                      type: deployment
+                      name: php-cve-demo-web
+                      components:
+                        - {bom-ref: "image:php-cve-demo", type: image, name: php-cve-demo, uri: "{{ image_ref }}"}
+                      properties:
+                        - {name: workload.type, value: "k8s:Deployment"}
+          services:
+            - bom-ref: service:php-cve-demo-web
+              name: php-cve-demo-web
+              network_exposure: public
+              endpoints: ["/"]
+              base-url: https://php-cve-demo-php-cve-demo.apps.itz-r87cnx.pok-lb.techzone.ibm.com
+              port: 443
+          dependencies:
+            - {ref: "environment:{{ concert_env }}", dependsOn: ["infra:kubernetes:openshift:itz-r87cnx"]}
+            - {ref: "image:php-cve-demo", dependsOn: ["service:php-cve-demo-web"]}
+          tags: [demo, php2shell]
+
+    - name: Upload the deploy SBOM to Concert
+      ansible.builtin.uri:
+        url: "{{ concert_url }}/ingestion/api/v1/upload_files"
+        method: POST
+        headers: "{{ concert_headers }}"
+        body_format: form-multipart
+        body:
+          data_type: application_sbom
+          filename:
+            filename: /tmp/php-cve-demo-deploy-sbom.json
+            mime_type: application/json
+        status_code: [200, 201, 202]
+
+    # 5. Verify in Concert (a 202 only means "accepted": wait for the data itself)
+    - name: Find the application in Concert
+      ansible.builtin.uri:
+        url: "{{ concert_url }}/core/api/v2/applications?filter=versions:all&page_size=2000"
+        headers: "{{ concert_headers }}"
+      register: apps
+
+    - name: Wait until Concert reflects the scan
+      ansible.builtin.uri:
+        url: "{{ concert_url }}/core/api/v1/applications/{{ (apps.json.applications | selectattr('name', 'equalto', concert_app) | first).id }}/cves"
+        headers: "{{ concert_headers }}"
+      register: app_cves
+      vars:
+        open_php2shell: "{{ app_cves.json.cves | default([]) | map(attribute='cve') | select('in', php2shell_cves) | list }}"
+      until: >-
+        app_cves.status == 200 and
+        ((php_target == 'fixed' and open_php2shell | length == 0) or
+         (php_target == 'vulnerable' and open_php2shell | length == php2shell_cves | length))
+      retries: 30
+      delay: 10
+
+    - name: Summary for Concert Workflows
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'REMEDIATED' if php_target == 'fixed' else 'RESET' }} php-cve-demo:
+          PHP {{ t.php }} image {{ image_ref }};
+          PHP2Shell in new scan: {{ php2shell_in_scan | join(',') if php2shell_in_scan else 'none' }};
+          Concert open CVEs: {{ app_cves.json.cves | length }};
+          Concert PHP2Shell open: {{ app_cves.json.cves | map(attribute='cve') | select('in', php2shell_cves) | join(',') or 'none' }}

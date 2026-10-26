@@ -1,7 +1,10 @@
 ---
 # AWX installs these on project sync (ansible-galaxy collection install).
 # The stock quay.io/ansible/awx-ee ships boto3/botocore but NOT amazon.aws,
-# so the collection must be declared here.
+# so the collection must be declared here. kubernetes.core is used by the
+# PHP2Shell demo playbook (php_cve_demo_deploy.yml).
 collections:
   - name: amazon.aws
     version: ">=8.0.0"
+  - name: kubernetes.core
+    version: ">=3.0.0"
