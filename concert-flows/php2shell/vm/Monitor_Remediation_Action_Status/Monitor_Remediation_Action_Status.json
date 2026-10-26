@@ -1,0 +1,597 @@
+{
+ "name": "Monitor_Remediation_Action_Status",
+ "platform": "node",
+ "hash": "pmqkGKOdNrNhuOCwUWmsX4V6WkhTOmNq5F61sdEPNT0=",
+ "blocks": [
+  {
+   "action": "comment",
+   "value": "Get the list of actions with status approval_awaiting."
+  },
+  {
+   "action": "system/IBM/Concert v2/Action Insights/Search in Actions",
+   "name": "getActionList",
+   "inputs": [
+    {
+     "name": "authKey",
+     "value": "$concert_auth"
+    },
+    {
+     "name": "Body",
+     "value": "{\n    \"filters\": {\n        \"logic\": \"and\",\n\n        \"conditions\": [{\n            \"field\": \"status\",\n            \"value\": \"approval_awaiting,approved\",\n            \"operator\": \"IN\"\n        }, {\n            \"field\": \"risk_type\",\n            \"value\": \"VULNERABILITY\",\n            \"operator\": \"=\"\n        }, {\n            \"field\": \"action_category\",\n            \"value\": \"auto_remediation\",\n            \"operator\": \"=\"\n        }]\n    },\n    \"sort\": {\n        \"field\": \"last_update_date\",\n        \"order\": \"asc\"\n    },\n    \"pagination\": {\n        \"page\": 1,\n        \"page_size\": 10000\n    }\n}"
+    }
+   ]
+  },
+  {
+   "action": "if",
+   "name": "CheckActionsExist",
+   "condition": "Array.isArray($getActionList.result.actions) && $getActionList.result.actions.length !== 0",
+   "then": [
+    {
+     "action": "foreach",
+     "name": "segregateActionsLoop",
+     "list": "$getActionList.result.actions",
+     "blocks": [
+      {
+       "action": "if",
+       "name": "checkIfTypePR",
+       "condition": "$segregateActionsLoop.item.action_type === \"pull_request\"",
+       "then": [
+        {
+         "action": "system/Common/Array/Array Push",
+         "name": "addToPRActions",
+         "inputs": [
+          {
+           "name": "array",
+           "value": "$pr_actions"
+          },
+          {
+           "name": "item",
+           "value": "$segregateActionsLoop.item"
+          }
+         ]
+        }
+       ],
+       "else": [
+        {
+         "action": "if",
+         "name": "ifSubtypeOsWebserver",
+         "condition": "[\"os\", \"webserver\"].includes($segregateActionsLoop.item.action_subtype)",
+         "then": [
+          {
+           "action": "system/Common/Array/Array Push",
+           "name": "addToPatchActions",
+           "inputs": [
+            {
+             "name": "array",
+             "value": "$patch_actions"
+            },
+            {
+             "name": "item",
+             "value": "$segregateActionsLoop.item"
+            }
+           ]
+          }
+         ],
+         "else": []
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "name": "Split_1",
+     "action": "split",
+     "branches": [
+      {
+       "blocks": [
+        {
+         "name": "Function_3",
+         "function": "function groupActions(group_by, items) {\n    return items.reduce((acc, item) => {\n        const key = item[group_by];\n\n        if (!acc[key]) {\n            acc[key] = {\n                \"actions\": [],\n                \"change_request\": {},\n                \"scheduled\": false,\n                \"status\": \"\"\n            };\n        }\n\n        const details = JSON.parse(item.action_details);\n        acc[key][\"actions\"].push(item);\n        acc[key][\"change_request\"] = details.change_request;\n        acc[key][\"schedule_time\"] = (details.maintenance_window ? details.maintenance_window.start_time : 0);\n        acc[key][\"wf_response\"] = {};\n        return acc;\n    }, {});\n};\n\nif ($patch_actions) {\n    $action_by_group = groupActions($group_by, $patch_actions);\n}"
+        },
+        {
+         "action": "foreach",
+         "name": "for_each_action",
+         "list": "Object.keys($action_by_group)",
+         "blocks": [
+          {
+           "action": "comment",
+           "value": "Fetch the incident status from Servicenow"
+          },
+          {
+           "action": "if",
+           "name": "IfConcertSourcedAction",
+           "condition": "$action_by_group[$for_each_action.item].change_request && $action_by_group[$for_each_action.item].change_request.source === 'Concert'",
+           "then": [
+            {
+             "name": "ConcertApprovalStatus",
+             "function": "// php-portal demo change: actions raised by Concert itself (no ServiceNow incident) count as approved\n// once every action in the group is approved in the Concert Action center.\n$cr_status = $action_by_group[$for_each_action.item].actions.every(a => a.status === 'approved') ? 'approved' : 'pending';"
+            }
+           ],
+           "else": [
+            {
+             "action": "./Monitor_Change_Request_Helpers/Check_Change_Request_Status",
+             "name": "CheckChangeRequestStatus",
+             "inputs": [
+              {
+               "name": "sm_auth",
+               "value": "$sm_auth"
+              },
+              {
+               "name": "change_request_detail",
+               "value": "$action_by_group[$for_each_action.item].change_request"
+              }
+             ]
+            },
+            {
+             "action": "assign",
+             "name": "AssignCRStatus",
+             "variable": "$cr_status",
+             "value": "$CheckChangeRequestStatus.result"
+            }
+           ]
+          },
+          {
+           "action": "switch",
+           "name": "CRStatus",
+           "expression": "$cr_status",
+           "cases": [
+            {
+             "value": "\"approved\"",
+             "blocks": [
+              {
+               "action": "assign",
+               "name": "Assign_4",
+               "variable": "$action_by_group[$for_each_action.item][\"status\"]",
+               "value": "$CheckChangeRequestStatus.result"
+              },
+              {
+               "action": "system/IBM/Concert v2/Action Insights/Search in Actions",
+               "name": "getScheduledActionList",
+               "inputs": [
+                {
+                 "name": "authKey",
+                 "value": "$concert_auth"
+                },
+                {
+                 "name": "Body",
+                 "value": "{\n    \"filters\": {\n        \"logic\": \"and\",\n\n        \"conditions\": [{\n            \"field\": \"status\",\n            \"value\": \"scheduled\",\n            \"operator\": \"=\"\n        }, {\n            \"field\": \"risk_type\",\n            \"value\": \"VULNERABILITY\",\n            \"operator\": \"=\"\n        }, {\n            \"field\": \"action_category\",\n            \"value\": \"auto_remediation\",\n            \"operator\": \"=\"\n        }, {\n            \"field\": $group_by,\n            \"value\": $for_each_action.item,\n            \"operator\": \"=\"\n        }]\n    },\n    \"sort\": {\n        \"field\": \"last_update_date\",\n        \"order\": \"asc\"\n    },\n    \"pagination\": {\n        \"page\": 1,\n        \"page_size\": 1000\n    }\n}"
+                }
+               ]
+              },
+              {
+               "action": "if",
+               "name": "If_1",
+               "condition": "$getScheduledActionList.statusCode == 200 && $getScheduledActionList.result.actions.length !== 0",
+               "then": [
+                {
+                 "action": "assign",
+                 "name": "SetScheduledStatus",
+                 "variable": "$action_by_group[$for_each_action.item][\"status\"]",
+                 "value": "\"scheduled\""
+                }
+               ],
+               "else": [
+                {
+                 "action": "comment",
+                 "value": "Check any action for the given application is already scheduled. If yes , then set all actions as scheduled otherwise schedule the workflow and then set status as scheduled"
+                },
+                {
+                 "name": "Function_4",
+                 "function": "function createPayloadFromTimestamp(\n    unixTimestampSeconds,\n    id,\n    value,\n    task_name,\n    group_by,\n    sm_auth,\n    windows_auth,\n    linux_auth\n) {\n    if (unixTimestampSeconds == 0)\n        return {};\n\n    const date = new Date(unixTimestampSeconds * 1000);\n\n    const options = {\n        timeZone: \"Asia/Calcutta\",\n        hour12: false,\n        hour: \"2-digit\",\n        minute: \"2-digit\",\n        day: \"2-digit\",\n        month: \"2-digit\",\n        year: \"numeric\"\n    };\n\n    const formatter = new Intl.DateTimeFormat(\"en-IN\", options);\n    const parts = formatter.formatToParts(date);\n    let hour, minute, month, year;\n\n    for (const part of parts) {\n        if (part.type === \"hour\")\n            hour = part.value;\n\n        if (part.type === \"minute\")\n            minute = part.value;\n\n        if (part.type === \"month\")\n            month = part.value;\n\n        if (part.type === \"year\")\n            year = part.value;\n    }\n\n    const params = {\n        \"filter\": {\n            \"field\": group_by,\n            \"value\": value,\n            \"operator\": \"=\"\n        }\n    };\n\n    if (sm_auth && sm_auth !== \"\" && sm_auth !== \"\\\"\\\"\") {\n        params[\"sm_auth\"] = sm_auth;\n    }\n\n    if (windows_auth && windows_auth !== \"\" && windows_auth !== \"\\\"\\\"\") {\n        params[\"windows_auth\"] = windows_auth;\n    }\n\n    if (linux_auth && linux_auth !== \"\" && linux_auth !== \"\\\"\\\"\") {\n        params[\"linux_auth\"] = linux_auth;\n    }\n\n    const payload = {\n        name: \"Remediation_\" + id + \"_\" + unixTimestampSeconds,\n        workerGroup: \"default\",\n        flowUrn: task_name,\n        flowRevision: null,\n        flowSpecificRevision: null,\n        description: \"Job : Patch scheduled from work flow for the action_id \" + id,\n        enabled: true,\n        timezone: \"Asia/Kolkata\",\n        startTime: unixTimestampSeconds * 1000,\n        ends: \"never\",\n        second: \"0\",\n        minute: minute,\n        hour: hour,\n        dayOfMonth: \"?\",\n        cron: \"0 * * ? * *\",\n        month: \"*\",\n        dayOfWeek: \"*\",\n        year: \"*\",\n        specialCondition: \"b1\",\n        repeats: 1,\n        params: params\n    };\n\n    return payload;\n};\n\n$action_by_group[$for_each_action.item][\"wf_payload\"] = createPayloadFromTimestamp(\n    $action_by_group[$for_each_action.item].schedule_time,\n    $action_by_group[$for_each_action.item].change_request.number,\n    $for_each_action.item,\n    $wf_to_schedule,\n    $group_by,\n    $sm_auth,\n    $windows_auth,\n    $linux_auth\n)"
+                },
+                {
+                 "action": "system/Pliant/flow-schedule-controller/createFlowSchedule",
+                 "name": "Schedule_WF",
+                 "inputs": [
+                  {
+                   "name": "authKey",
+                   "value": "$workflow_auth"
+                  },
+                  {
+                   "name": "userName",
+                   "value": "$workflow_user"
+                  },
+                  {
+                   "name": "scheduleDto",
+                   "value": "$action_by_group[$for_each_action.item][\"wf_payload\"]"
+                  }
+                 ]
+                },
+                {
+                 "action": "if",
+                 "name": "CheckIfScheduledSuccess",
+                 "condition": "$Schedule_WF.result?.enabled",
+                 "then": [
+                  {
+                   "action": "assign",
+                   "name": "SetScheduledStatus_1",
+                   "variable": "$action_by_group[$for_each_action.item][\"status\"]",
+                   "value": "\"scheduled\""
+                  }
+                 ],
+                 "else": [
+                  {
+                   "action": "assign",
+                   "name": "wf_response",
+                   "variable": "$action_by_group[$for_each_action.item][\"wf_response\"]",
+                   "value": "$Schedule_WF.result"
+                  }
+                 ]
+                }
+               ]
+              }
+             ]
+            },
+            {
+             "value": "\"rejected\"",
+             "blocks": [
+              {
+               "action": "assign",
+               "name": "Assign_3_1",
+               "variable": "$action_by_group[$for_each_action.item][\"status\"]",
+               "value": "$CheckChangeRequestStatus.result"
+              }
+             ]
+            }
+           ],
+           "default": [
+            {
+             "action": "continue"
+            }
+           ]
+          },
+          {
+           "name": "Function_2",
+           "function": "function createUpdateBody(record, user) {\n    let updatedActions = [];\n\n    record.actions.forEach(item => {\n        let historyObject = [];\n\n        try {\n            if (typeof item.history === \"string\") {\n                historyObject = JSON.parse(item.history);\n            } else if (Array.isArray(item.history)) {\n                historyObject = item.history;\n            }\n        } catch (e) {\n            historyObject = [];\n        }\n\n        let newEvent = {\n            \"event\": \"Action status update: \" + record.status,\n            \"user\": user,\n            \"timestamp\": Math.floor(Date.now() / 1000),\n            \"comments\": \"Change request has been \" + record.status\n        };\n\n        historyObject.push(newEvent);\n\n        const action = {\n            action_id: item.actions_identifier,\n            status: record.status,\n            history: JSON.stringify(historyObject)\n        };\n\n        updatedActions.push(action);\n    });\n\n    return updatedActions;\n};\n\n$request_body[$for_each_action.item] = createUpdateBody($action_by_group[$for_each_action.item], $workflow_user)"
+          },
+          {
+           "action": "try",
+           "name": "Try_1",
+           "try": [
+            {
+             "action": "system/IBM/Concert v2/Action Insights/Update Existing Action",
+             "name": "UpdateActionStatus",
+             "inputs": [
+              {
+               "name": "authKey",
+               "value": "$concert_auth"
+              },
+              {
+               "name": "Body",
+               "value": "{\n    \"actions\": $request_body[$for_each_action.item]\n}"
+              }
+             ]
+            }
+           ],
+           "catch": []
+          },
+          {
+           "action": "if",
+           "name": "CheckPatchResponse",
+           "condition": "$UpdateActionStatus && Array.isArray($UpdateActionStatus.result?.actions) && $UpdateActionStatus.result.actions.length > 0",
+           "then": [
+            {
+             "action": "assign",
+             "name": "Update_Successful",
+             "variable": "$result[$for_each_action.item]",
+             "value": "{\n    \"status_updated\": $action_by_group[$for_each_action.item].status\n}"
+            }
+           ],
+           "else": [
+            {
+             "action": "assign",
+             "name": "Update_Status_Failure",
+             "variable": "$result[$for_each_action.item]",
+             "value": "{\n    \"action_api_status\": $UpdateActionStatus.result,\n    \"status_to_update\": $action_by_group[$for_each_action.item].status,\n    \"wf_response\": $action_by_group[$for_each_action.item][\"wf_response\"]\n}"
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "blocks": [
+        {
+         "action": "comment",
+         "value": "flow to update actions of type pull_request"
+        },
+        {
+         "action": "./Monitor_Change_Request_Helpers/Check_PR_status",
+         "name": "checkPRStatus",
+         "inputs": [
+          {
+           "name": "actions_list",
+           "value": "$pr_actions"
+          },
+          {
+           "name": "git_auth",
+           "value": "$git_auth"
+          }
+         ]
+        },
+        {
+         "action": "if",
+         "name": "ifPatchActionsPresent",
+         "condition": "$checkPRStatus.patch_action_list.length > 0",
+         "then": [
+          {
+           "action": "system/IBM/Concert v2/Action Insights/Update Existing Action",
+           "name": "patchActionStatus",
+           "inputs": [
+            {
+             "name": "authKey",
+             "value": "$concert_auth"
+            },
+            {
+             "name": "Body",
+             "value": "{\n    \"actions\": $checkPRStatus.patch_action_list\n}"
+            }
+           ]
+          }
+         ],
+         "else": []
+        }
+       ]
+      }
+     ]
+    }
+   ],
+   "else": [
+    {
+     "action": "assign",
+     "name": "Assign_2",
+     "variable": "$result",
+     "value": "{\"message\": \"No actions found\"}"
+    },
+    {
+     "action": "exit"
+    }
+   ]
+  }
+ ],
+ "variables": [
+  {
+   "name": "sm_auth",
+   "required": true,
+   "isInput": true,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"\"",
+   "meta": {
+    "authType": "ANY",
+    "subType": "authentication"
+   }
+  },
+  {
+   "name": "workflow_auth",
+   "required": true,
+   "isInput": true,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"\"",
+   "meta": {
+    "authType": "ANY",
+    "subType": "authentication"
+   }
+  },
+  {
+   "name": "wf_to_schedule",
+   "required": true,
+   "isInput": true,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"\""
+  },
+  {
+   "name": "workflow_user",
+   "required": true,
+   "isInput": true,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"\""
+  },
+  {
+   "name": "windows_auth",
+   "required": false,
+   "isInput": true,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"\"",
+   "meta": {
+    "authType": "ANY",
+    "subType": "authentication"
+   }
+  },
+  {
+   "name": "linux_auth",
+   "required": false,
+   "isInput": true,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"\"",
+   "meta": {
+    "authType": "ANY",
+    "subType": "authentication"
+   }
+  },
+  {
+   "name": "git_auth",
+   "required": false,
+   "isInput": true,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"\"",
+   "meta": {
+    "authType": "Github",
+    "subType": "authentication"
+   }
+  },
+  {
+   "name": "concert_auth",
+   "required": false,
+   "isInput": true,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"\"",
+   "meta": {
+    "authType": "ANY",
+    "subType": "authentication"
+   }
+  },
+  {
+   "name": "result",
+   "required": false,
+   "isInput": false,
+   "isOutput": true,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "object"
+   },
+   "value": "{}"
+  },
+  {
+   "name": "status_update",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "object"
+   },
+   "value": "{}"
+  },
+  {
+   "name": "group_by",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string",
+    "enum": [
+     "target_component_identifier",
+     "app_release_id",
+     "application_name",
+     "actions_identifier"
+    ]
+   },
+   "value": "\"actions_identifier\""
+  },
+  {
+   "name": "action_by_group",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "object"
+   },
+   "value": "{}"
+  },
+  {
+   "name": "request_body",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "object"
+   },
+   "value": "{}"
+  },
+  {
+   "name": "workflow_api_base_path",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"/workflows\""
+  },
+  {
+   "name": "patch_actions",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "array"
+   },
+   "value": "[]"
+  },
+  {
+   "name": "pr_actions",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "array"
+   },
+   "value": "[]"
+  },
+  {
+   "name": "cr_status",
+   "required": false,
+   "isInput": false,
+   "isOutput": false,
+   "level": "INTERMEDIATE",
+   "type": {
+    "type": "string"
+   },
+   "value": "\"\""
+  }
+ ],
+ "meta": {
+  "workerGroup": "default",
+  "created": 1771285735689,
+  "lastUpdated": 1793032061038,
+  "description": "Monitor remediation action status and schedule | MODIFIED for the php-portal demo: actions whose change_request.source is Concert are treated as approved when approved in the Action center (no ServiceNow incident needed); tolerates actions without a maintenance window.",
+  "layout": "flow",
+  "updatedByUsername": "concertuser",
+  "numberOfBlocks": 41,
+  "version": 5,
+  "tags": [
+   {
+    "name": "Consumer",
+    "value": "Concert"
+   },
+   {
+    "name": "Concert version",
+    "value": "2.3.0"
+   },
+   {
+    "name": "Category",
+    "value": "Vulnerability"
+   }
+  ]
+ },
+ "finally": null
+}
