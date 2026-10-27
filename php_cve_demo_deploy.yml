@@ -70,7 +70,7 @@
       ansible.builtin.set_fact:
         image_ref: "{{ (running.resources[0].spec.template.spec.containers | selectattr('name', 'equalto', 'web') | first).image }}"
         image_digest: "{{ (running.resources[0].spec.template.spec.containers | selectattr('name', 'equalto', 'web') | first).image.split('@') | last }}"
-        running_target: "{{ 'fixed' if ('PHP ' ~ targets.fixed.php) in running_web.content else 'vulnerable' }}"
+        running_target: "{{ 'fixed' if ('PHP ' ~ targets.fixed.php ~ '<') in running_web.content else 'vulnerable' }}"
       when: php_target == 'scan'
 
     - name: Build and roll out PHP {{ t.php }}
