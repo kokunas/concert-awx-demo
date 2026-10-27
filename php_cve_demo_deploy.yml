@@ -4,6 +4,7 @@
 #   php_target=fixed       -> remediate: build PHP 8.4.27 image, roll it out, rescan with Trivy,
 #                             upload the scan + updated deploy SBOM to Concert, wait until the CVEs close.
 #   php_target=vulnerable  -> reset the demo: same steps with the PHP 8.4.24 image (the CVEs reopen).
+#   php_target=scan        -> rescan only: Trivy against the image running now, upload the scan to Concert.
 #
 # Credentials injected by the AWX job template (nothing embedded here):
 #   "OpenShift or Kubernetes API Bearer Token" -> K8S_AUTH_HOST, K8S_AUTH_API_KEY, K8S_AUTH_SSL_CA_CERT
@@ -20,7 +21,7 @@
     targets:
       fixed: {buildconfig: php-portal-fixed, tag: "1.0.1", php: "8.4.27"}
       vulnerable: {buildconfig: php-portal, tag: "1.0.0", php: "8.4.24"}
-    t: "{{ targets[php_target] }}"
+    t: "{{ targets[running_target | default(php_target)] }}"
     registry: image-registry.openshift-image-registry.svc:5000
     concert_app: php-portal
     concert_app_version: "1.0.0"
@@ -43,86 +44,114 @@
     - name: Check inputs
       ansible.builtin.assert:
         that:
-          - php_target in targets
+          - php_target in targets or php_target == 'scan'
           - k8s_host | length > 0
           - concert_url | length > 0
-        fail_msg: "php_target must be fixed|vulnerable and both credentials must be attached"
+        fail_msg: "php_target must be fixed|vulnerable|scan and both credentials must be attached"
 
-    # 1. Build the image from git (BuildConfig with the pinned PHP package version)
-    - name: Start build {{ t.buildconfig }}
-      ansible.builtin.uri:
-        url: "{{ k8s_host }}/apis/build.openshift.io/v1/namespaces/{{ demo_ns }}/buildconfigs/{{ t.buildconfig }}/instantiate"
-        method: POST
-        headers: {Authorization: "Bearer {{ k8s_token }}"}
-        ca_path: "{{ k8s_ca }}"
-        body_format: json
-        body: {kind: BuildRequest, apiVersion: build.openshift.io/v1, metadata: {name: "{{ t.buildconfig }}"}}
-        status_code: [200, 201]
-      register: build_req
-
-    - name: Wait for build {{ build_req.json.metadata.name }}
-      kubernetes.core.k8s_info:
-        api_version: build.openshift.io/v1
-        kind: Build
-        namespace: "{{ demo_ns }}"
-        name: "{{ build_req.json.metadata.name }}"
-      register: build
-      until: build.resources | length > 0 and build.resources[0].status.phase in ['Complete', 'Failed', 'Error', 'Cancelled']
-      retries: 60
-      delay: 10
-
-    - name: Fail if the build did not complete
-      ansible.builtin.assert:
-        that: build.resources[0].status.phase == 'Complete'
-        fail_msg: "Build {{ build_req.json.metadata.name }} ended in {{ build.resources[0].status.phase }}"
-
-    - name: Record the new image digest
-      ansible.builtin.set_fact:
-        image_ref: "{{ registry }}/{{ demo_ns }}/{{ concert_image }}@{{ build.resources[0].status.output.to.imageDigest }}"
-
-    # 2. Roll it out
-    # The image is pinned by digest and the ImageStream trigger is removed, so only this job decides what runs.
-    - name: Point the deployment at {{ concert_image }}:{{ t.tag }} ({{ image_ref }})
-      kubernetes.core.k8s:
-        state: patched
-        api_version: apps/v1
-        kind: Deployment
-        namespace: "{{ demo_ns }}"
-        name: "{{ deployment }}"
-        definition:
-          metadata:
-            annotations:
-              image.openshift.io/triggers: null
-          spec:
-            template:
-              spec:
-                containers:
-                  - name: web
-                    image: "{{ image_ref }}"
-
-    - name: Wait for the rollout
+    # 0. Rescan only: take the image the deployment runs now
+    - name: Read the running deployment
       kubernetes.core.k8s_info:
         api_version: apps/v1
         kind: Deployment
         namespace: "{{ demo_ns }}"
         name: "{{ deployment }}"
-      register: dep
-      until: >-
-        dep.resources[0].status.observedGeneration | default(0) >= dep.resources[0].metadata.generation and
-        dep.resources[0].status.updatedReplicas | default(0) == dep.resources[0].spec.replicas and
-        dep.resources[0].status.availableReplicas | default(0) == dep.resources[0].spec.replicas and
-        dep.resources[0].status.replicas | default(0) == dep.resources[0].spec.replicas
-      retries: 36
-      delay: 5
+      register: running
+      when: php_target == 'scan'
 
-    - name: Check the web reports PHP {{ t.php }}
+    - name: Read the PHP version the web reports
       ansible.builtin.uri:
         url: "http://{{ deployment }}.{{ demo_ns }}.svc:8080/"
         return_content: true
-      register: web
-      until: ("PHP " ~ t.php) in web.content
-      retries: 12
-      delay: 5
+      register: running_web
+      when: php_target == 'scan'
+
+    - name: Use the running image
+      ansible.builtin.set_fact:
+        image_ref: "{{ (running.resources[0].spec.template.spec.containers | selectattr('name', 'equalto', 'web') | first).image }}"
+        image_digest: "{{ (running.resources[0].spec.template.spec.containers | selectattr('name', 'equalto', 'web') | first).image.split('@') | last }}"
+        running_target: "{{ 'fixed' if ('PHP ' ~ targets.fixed.php) in running_web.content else 'vulnerable' }}"
+      when: php_target == 'scan'
+
+    - name: Build and roll out PHP {{ t.php }}
+      when: php_target != 'scan'
+      block:
+      # 1. Build the image from git (BuildConfig with the pinned PHP package version)
+      - name: Start build {{ t.buildconfig }}
+        ansible.builtin.uri:
+          url: "{{ k8s_host }}/apis/build.openshift.io/v1/namespaces/{{ demo_ns }}/buildconfigs/{{ t.buildconfig }}/instantiate"
+          method: POST
+          headers: {Authorization: "Bearer {{ k8s_token }}"}
+          ca_path: "{{ k8s_ca }}"
+          body_format: json
+          body: {kind: BuildRequest, apiVersion: build.openshift.io/v1, metadata: {name: "{{ t.buildconfig }}"}}
+          status_code: [200, 201]
+        register: build_req
+
+      - name: Wait for build {{ build_req.json.metadata.name }}
+        kubernetes.core.k8s_info:
+          api_version: build.openshift.io/v1
+          kind: Build
+          namespace: "{{ demo_ns }}"
+          name: "{{ build_req.json.metadata.name }}"
+        register: build
+        until: build.resources | length > 0 and build.resources[0].status.phase in ['Complete', 'Failed', 'Error', 'Cancelled']
+        retries: 60
+        delay: 10
+
+      - name: Fail if the build did not complete
+        ansible.builtin.assert:
+          that: build.resources[0].status.phase == 'Complete'
+          fail_msg: "Build {{ build_req.json.metadata.name }} ended in {{ build.resources[0].status.phase }}"
+
+      - name: Record the new image digest
+        ansible.builtin.set_fact:
+          image_digest: "{{ build.resources[0].status.output.to.imageDigest }}"
+          image_ref: "{{ registry }}/{{ demo_ns }}/{{ concert_image }}@{{ build.resources[0].status.output.to.imageDigest }}"
+
+      # 2. Roll it out
+      # The image is pinned by digest and the ImageStream trigger is removed, so only this job decides what runs.
+      - name: Point the deployment at {{ concert_image }}:{{ t.tag }} ({{ image_ref }})
+        kubernetes.core.k8s:
+          state: patched
+          api_version: apps/v1
+          kind: Deployment
+          namespace: "{{ demo_ns }}"
+          name: "{{ deployment }}"
+          definition:
+            metadata:
+              annotations:
+                image.openshift.io/triggers: null
+            spec:
+              template:
+                spec:
+                  containers:
+                    - name: web
+                      image: "{{ image_ref }}"
+
+      - name: Wait for the rollout
+        kubernetes.core.k8s_info:
+          api_version: apps/v1
+          kind: Deployment
+          namespace: "{{ demo_ns }}"
+          name: "{{ deployment }}"
+        register: dep
+        until: >-
+          dep.resources[0].status.observedGeneration | default(0) >= dep.resources[0].metadata.generation and
+          dep.resources[0].status.updatedReplicas | default(0) == dep.resources[0].spec.replicas and
+          dep.resources[0].status.availableReplicas | default(0) == dep.resources[0].spec.replicas and
+          dep.resources[0].status.replicas | default(0) == dep.resources[0].spec.replicas
+        retries: 36
+        delay: 5
+
+      - name: Check the web reports PHP {{ t.php }}
+        ansible.builtin.uri:
+          url: "http://{{ deployment }}.{{ demo_ns }}.svc:8080/"
+          return_content: true
+        register: web
+        until: ("PHP " ~ t.php) in web.content
+        retries: 12
+        delay: 5
 
     # 3. Rescan the running image with Trivy inside the cluster
     - name: Remove a previous scan job
@@ -269,7 +298,7 @@
                       type: deployment
                       name: "{{ concert_component }}"
                       components:
-                        - {bom-ref: "image:{{ concert_image }}", type: image, name: "{{ concert_image }}", uri: "{{ registry }}/{{ demo_ns }}/{{ concert_image }}:{{ t.tag }}@{{ build.resources[0].status.output.to.imageDigest }}"}
+                        - {bom-ref: "image:{{ concert_image }}", type: image, name: "{{ concert_image }}", uri: "{{ registry }}/{{ demo_ns }}/{{ concert_image }}:{{ t.tag }}@{{ image_digest }}"}
                       properties:
                         - {name: workload.type, value: "k8s:Deployment"}
           services:
@@ -349,7 +378,7 @@
           metadata:
             image_name: "{{ concert_image }}"
             image_tag: "{{ t.tag }}"
-            image_digest: "{{ build.resources[0].status.output.to.imageDigest }}"
+            image_digest: "{{ image_digest }}"
             scanner_name: trivy
             application_name: "{{ concert_app }}"
             application_version: "{{ concert_app_version }}"
@@ -371,7 +400,7 @@
         php2shell_after: "{{ app_cves.json.cves | default([]) | selectattr('cve', 'in', php2shell_cves) | map(attribute='total_findings') | sum }}"
       until: >-
         app_cves.status == 200 and
-        ((php_target == 'fixed' and (php2shell_after | int < php2shell_before | int or php2shell_before | int == 0)) or
+        (php_target == 'scan' or (php_target == 'fixed' and (php2shell_after | int < php2shell_before | int or php2shell_before | int == 0)) or
          (php_target == 'vulnerable' and php2shell_after | int >= php2shell_before | int and php2shell_after | int > 0))
       retries: 30
       delay: 10
@@ -379,7 +408,7 @@
     - name: Summary for Concert Workflows
       ansible.builtin.debug:
         msg: >-
-          {{ 'REMEDIATED' if php_target == 'fixed' else 'RESET' }} {{ concert_app }} (OpenShift):
+          {{ {'fixed': 'REMEDIATED', 'vulnerable': 'RESET', 'scan': 'RESCANNED'}[php_target] }} {{ concert_app }} (OpenShift):
           PHP {{ t.php }} image {{ image_ref }};
           PHP2Shell in new scan: {{ php2shell_in_scan | join(',') if php2shell_in_scan else 'none' }};
           Concert open CVEs (whole app): {{ app_cves.json.cves | length }};
